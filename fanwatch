@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+# fanwatch - live ThinkPad fan/temperature monitor for the P15 (thinkfan-managed)
+# Shows CPU/GPU EC temps with trend arrows, a sparkline of recent CPU history,
+# the live thinkfan level + RPM, and a callout whenever the fan level changes.
+#
+# Usage: fanwatch [interval_seconds]   (default 2)
+#        fanwatch update               (self-update in place)
+
+export LC_ALL=C
+
+# Bump on release. install.sh greps this line to report what an update did.
+VERSION=0.1.0
+
+# Subcommand: self-update by re-running the installer. Handled before the
+# positional interval below, which would otherwise read "update" as an interval.
+# FANWATCH_RAW_URL selects a fork/branch, matching install.sh's own override.
+if [[ ${1:-} == update ]]; then
+  shift
+  command -v curl >/dev/null 2>&1 || { printf 'fanwatch: update needs curl on PATH\n' >&2; exit 1; }
+  raw_url=${FANWATCH_RAW_URL:-https://raw.githubusercontent.com/mjfwebb/fanwatch/main}
+  # pipefail so a failed download surfaces instead of being masked by bash
+  # exiting 0 on empty stdin.
+  set -o pipefail
+  curl -fsSL "$raw_url/install.sh" | bash -s -- "$@"
+  exit $?
+fi
+
+interval="${1:-2}"
+FAN=/proc/acpi/ibm/fan
+THERMAL=/proc/acpi/ibm/thermal
+CONFIG=/etc/thinkfan.yaml
+
+# Investigate the likely culprit when CPU temp jumps by at least this many °C
+# between samples (override with FANWATCH_RISE).
+RISE="${FANWATCH_RISE:-3}"
+
+# Derive the off-threshold straight from thinkfan's config so it never goes
+# stale: the fan drops to level 0 once temps fall below the LOWER bound of the
+# lowest non-zero level. Parse each "- [level, lower, upper]" entry, skip
+# level 0, and take the smallest lower bound. Falls back to 58 if unreadable.
+parse_off_below() {
+  local config=$1 v
+  v=$(awk '
+    /^[[:space:]]*-[[:space:]]*\[/ {
+      s=$0; gsub(/.*\[/,"",s); gsub(/\].*/,"",s); n=split(s,a,",")
+      lvl=a[1]; gsub(/[[:space:]"]/,"",lvl)
+      low=a[2]; gsub(/[[:space:]]/,"",low)
+      if (lvl!="0" && low ~ /^[0-9]+$/ && (min=="" || low+0<min)) min=low+0
+    }
+    END { print (min=="" ? 58 : min) }
+  ' "$config" 2>/dev/null)
+  [[ "$v" =~ ^[0-9]+$ ]] || v=58
+  printf '%s' "$v"
+}
+OFF_BELOW=$(parse_off_below "$CONFIG")
+
+# --- colors -----------------------------------------------------------------
+if [[ -t 1 ]]; then
+  R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; B=$'\e[34m'; C=$'\e[36m'
+  GR=$'\e[90m'; BOLD=$'\e[1m'; RST=$'\e[0m'
+else
+  R= G= Y= B= C= GR= BOLD= RST=
+fi
+
+# color a temperature by how hot it is
+tcolor() { local t=$1
+  if   (( t < OFF_BELOW )); then printf '%s' "$G"
+  elif (( t < 70 ));        then printf '%s' "$C"
+  elif (( t < 82 ));        then printf '%s' "$Y"
+  else                           printf '%s' "$R"; fi
+}
+
+# trend arrow comparing current vs previous
+arrow() { local cur=$1 prev=$2
+  [[ -z $prev ]] && { printf ' '; return; }
+  if   (( cur > prev )); then printf '%s▲%s' "$Y" "$RST"
+  elif (( cur < prev )); then printf '%s▼%s' "$B" "$RST"
+  else                        printf '%s—%s' "$GR" "$RST"; fi
+}
+
+# sparkline of the CPU history array, scaled 40..90C
+SPARK=(▁ ▂ ▃ ▄ ▅ ▆ ▇ █)
+hist=()
+sparkline() {
+  local out="" v idx lo=40 hi=90 span=$((90-40))
+  for v in "${hist[@]}"; do
+    (( v < lo )) && v=$lo; (( v > hi )) && v=$hi
+    idx=$(( (v-lo)*7/span ))
+    out+="${SPARK[$idx]}"
+  done
+  printf '%s' "$out"
+}
+
+# --- culprit attribution ----------------------------------------------------
+# Temperature lags load, so when a rise is seen the culprit is whatever has
+# been driving the CPU/GPU over the last moment. These run ONLY on a rise, so
+# the steady-state loop stays cheap.
+
+# Top CPU consumers right now, aggregated by program name. Uses top's SECOND
+# iteration (recent %CPU, not the lifetime average ps reports) and resolves clean
+# names from /proc/<pid>/cmdline (top's COMMAND column and comm both truncate),
+# then sums per name so multi-process apps (browsers!) show their true total.
+# Skips top/fanwatch/self. e.g. "brave 212% · gnome-shell 23% · claude 21%"
+culprit_cpu() {
+  local pid pct name cl
+  while read -r pid pct; do
+    # prefer the full executable basename from cmdline; fall back to comm
+    # (kernel-capped at 15 chars). Skip if the process already exited.
+    name=""
+    [[ -r /proc/$pid/comm ]] && read -r name < "/proc/$pid/comm"
+    if [[ -r /proc/$pid/cmdline ]]; then
+      cl=$(tr '\0' ' ' < "/proc/$pid/cmdline"); cl=${cl%% *}; cl=${cl##*/}
+      [[ -n $cl ]] && name=$cl
+    fi
+    [[ -z $name || $name == top || $name == fanwatch ]] && continue
+    printf '%s %s\n' "$name" "$pct"
+  done < <(top -bn2 -d 0.2 2>/dev/null | awk '
+      /^[[:space:]]*PID/ { p++; next }
+      p == 2 { pct=$9; sub(",", ".", pct); if (pct+0 >= 1) print $1, pct }') \
+  | awk '{ sum[$1]+=$2 } END { for (k in sum) printf "%.0f %s\n", sum[k], k }' \
+  | sort -rn | head -3 \
+  | awk '{ printf "%s%s %s%%", sep, $2, $1; sep=" · " }'
+}
+
+# GPU consumers via nvidia-smi process monitor — works in hybrid/Optimus mode
+# for graphics apps (compute-apps query is usually empty there). e.g. "gnome-shell"
+culprit_gpu() {
+  command -v nvidia-smi >/dev/null 2>&1 || return
+  nvidia-smi pmon -c 1 2>/dev/null \
+  | awk 'NR>2 && $2 ~ /^[0-9]+$/ { print $NF }' \
+  | sort -u | paste -sd' · ' -
+}
+
+cleanup() { printf '%s\n' "$RST"; exit 0; }
+
+# When sourced (by the tests), stop here: everything above is definitions and
+# read-only discovery; the header and loop below would otherwise run on source.
+[[ ${BASH_SOURCE[0]} != "$0" ]] && return 0
+
+trap cleanup INT TERM
+
+prev_cpu=""; prev_gpu=""; prev_level=""
+printf '%sfanwatch%s  every %ss — Ctrl+C to quit   (fan turns OFF when EC CPU < %s°C)\n' \
+  "$BOLD" "$RST" "$interval" "$OFF_BELOW"
+printf '%s%-8s  %-7s  %-7s  %-12s  %-7s  %s%s\n' \
+  "$GR" "time" "CPU" "GPU" "fan level" "rpm" "cpu trend (40–90°C)" "$RST"
+
+while :; do
+  read -r cpu gpu _ < <(awk -F'\t' '/^temperatures:/{print $2}' "$THERMAL" | awk '{print $1, $2}')
+  level=$(awk '/^level:/{print $2}' "$FAN")
+  speed=$(awk '/^speed:/{print $2}' "$FAN")
+  [[ -z $cpu ]] && { sleep "$interval"; continue; }
+  ts=$(date +%H:%M:%S)
+
+  # track CPU history for the sparkline (keep last 40)
+  hist+=("$cpu"); (( ${#hist[@]} > 40 )) && hist=("${hist[@]: -40}")
+
+  # fan level styling: level 0 = off (green/silent), full-speed = red
+  if [[ $level == "0" ]]; then lvldisp="${G}0 (off)${RST}    "
+  elif [[ $level == "full-speed" || $level == "7" ]]; then lvldisp="${R}${level}${RST}        "
+  else lvldisp="${Y}${level}${RST}           "; fi
+
+  printf '%s%-8s%s  %s%2s°C%s %s  %s%2s°C%s %s  %b  %5s    %s\n' \
+    "$GR" "$ts" "$RST" \
+    "$(tcolor "$cpu")" "$cpu" "$RST" "$(arrow "$cpu" "$prev_cpu")" \
+    "$(tcolor "$gpu")" "$gpu" "$RST" "$(arrow "$gpu" "$prev_gpu")" \
+    "$lvldisp" "$speed" "$(sparkline)"
+
+  # culprit callout on a meaningful CPU temp rise
+  if [[ -n $prev_cpu ]] && (( cpu - prev_cpu >= RISE )); then
+    cpu_blame=$(culprit_cpu)
+    gpu_blame=$(culprit_gpu)
+    line="   ${GR}└─ ${Y}▲ +$((cpu - prev_cpu))°C${GR}  likely: ${RST}${cpu_blame:-?}"
+    [[ -n $gpu_blame ]] && line+="${GR}  │ gpu: ${RST}${gpu_blame}"
+    printf '%s%s\n' "$line" "$RST"
+  fi
+
+  # callout when the fan level changes
+  if [[ -n $prev_level && $level != "$prev_level" ]]; then
+    if [[ $level == "0" ]]; then
+      printf '   %s└─ fan level %s → %s%s%s  ✓ fan OFF (silent)%s\n' "$GR" "$prev_level" "$BOLD$G" "$level" "$RST$GR" "$RST"
+    else
+      dir="changed"; [[ $prev_level == "0" ]] && dir="spun up"
+      printf '   %s└─ fan level %s → %s%s%s  (%s)%s\n' "$GR" "$prev_level" "$BOLD" "$level" "$RST$GR" "$dir" "$RST"
+    fi
+  fi
+
+  prev_cpu=$cpu; prev_gpu=$gpu; prev_level=$level
+  sleep "$interval"
+done
