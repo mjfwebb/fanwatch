@@ -108,6 +108,81 @@ make_hwmon() {
   [ "$leveltext" = "0%" ]
 }
 
+# Fake macOS sensor helpers on a temp dir, returned for prepending to PATH.
+# smctemp covers cpu/gpu/fan (fan output carries an index to exercise parsing);
+# istats covers cpu temp + fan only.
+make_mac_tools() {
+  local dir="$BATS_TEST_TMPDIR/macbin"; mkdir -p "$dir"
+  cat >"$dir/smctemp" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+  -c) echo "61.8" ;;
+  -g) echo "47.2°C" ;;
+  -f) printf 'Fan 0: 2345 rpm\nFan 1: 3010 rpm\n' ;;
+esac
+EOF
+  cat >"$dir/istats" <<'EOF'
+#!/usr/bin/env bash
+[[ $1 == cpu ]] && echo "55.0"
+[[ $1 == fan ]] && echo "1800"
+EOF
+  chmod +x "$dir/smctemp" "$dir/istats"
+  printf '%s' "$dir"
+}
+
+# --- macOS backend (mocked SMC helpers) --------------------------------------
+
+@test "mac_round rounds the first number, or the largest with max" {
+  source "$FW"
+  [ "$(printf 'Fan 0: 2345 rpm\n' | mac_round)" = "0" ]      # first number is the index
+  [ "$(printf 'Fan 0: 2345 rpm\n' | mac_round max)" = "2345" ]
+  [ "$(printf '61.8°C\n' | mac_round)" = "62" ]
+}
+
+@test "discover_macos prefers smctemp and enables gpu+fan" {
+  source "$FW"; PATH="$(make_mac_tools):$PATH"
+  discover_macos
+  [ "$MAC_TEMP_TOOL" = "smctemp" ]
+  [ "$MAC_FAN_TOOL" = "smctemp" ]
+  [ "$MAC_GPU" -eq 1 ]
+}
+
+@test "FANWATCH_MAC_TOOL forces the helper" {
+  source "$FW"; PATH="$(make_mac_tools):$PATH"
+  FANWATCH_MAC_TOOL=istats discover_macos
+  [ "$MAC_TEMP_TOOL" = "istats" ]
+  [ "$MAC_GPU" -eq 0 ]
+}
+
+@test "sample_macos parses smctemp temps and the fastest fan" {
+  source "$FW"; PATH="$(make_mac_tools):$PATH"; discover_macos
+  sample_macos
+  [ "$cpu" = "62" ]
+  [ "$gpu" = "47" ]
+  [ "$rpm" = "3010" ]       # the faster of the two fans
+  [ "$leveltext" = "on" ]
+  [ "$fanoff" -eq 0 ]
+}
+
+@test "sample_macos via istats has cpu and fan but no gpu" {
+  source "$FW"; PATH="$(make_mac_tools):$PATH"
+  FANWATCH_MAC_TOOL=istats discover_macos
+  sample_macos
+  [ "$cpu" = "55" ]
+  [ -z "$gpu" ]
+  [ "$rpm" = "1800" ]
+}
+
+@test "sample_macos flags the fan as off at zero rpm" {
+  source "$FW"
+  dir="$BATS_TEST_TMPDIR/macoff"; mkdir -p "$dir"
+  printf '#!/usr/bin/env bash\ncase "$1" in -c) echo 40 ;; -f) echo 0 ;; esac\n' >"$dir/smctemp"
+  chmod +x "$dir/smctemp"; PATH="$dir:$PATH"; discover_macos
+  sample_macos
+  [ "$fanoff" -eq 1 ]
+  [ "$leveltext" = "off" ]
+}
+
 # --- parse_off_below: derive the fan-off threshold from thinkfan.yaml --------
 
 @test "parse_off_below takes the lowest non-zero level's lower bound" {

@@ -44,14 +44,18 @@ Options:
 Environment:
   FANWATCH_STICKY=0   start in the scrolling layout (same as --no-sticky)
   FANWATCH_RISE=N     investigate CPU jumps of N°C or more (default 3)
-  FANWATCH_BACKEND=X  force a backend: thinkpad | hwmon (default: auto-detect)
-  FANWATCH_OFF_BELOW=N  green below N°C in the hwmon backend (default 55; the
-                      thinkpad backend derives this from thinkfan.yaml instead)
+  FANWATCH_BACKEND=X  force a backend: thinkpad | hwmon | macos (default: auto)
+  FANWATCH_OFF_BELOW=N  green below N°C on the hwmon/macos backends (default 55;
+                      the thinkpad backend derives this from thinkfan.yaml)
 
   Sensor overrides (hwmon backend; give a sysfs path to skip auto-detection):
   FANWATCH_CPU_TEMP, FANWATCH_GPU_TEMP   e.g. /sys/class/hwmon/hwmon7/temp1_input
   FANWATCH_FAN        one or more fan*_input paths (space-separated)
   FANWATCH_PWM        a pwm* path, shown as a percentage of 255
+
+  macOS (reads the SMC via a helper tool on PATH):
+  FANWATCH_MAC_TOOL=T force the helper: smctemp | istats | osx-cpu-temp |
+                      powermetrics (default: first of those found)
 
 While running, Shift+Tab toggles between the pinned and scrolling layouts.
 EOF
@@ -250,6 +254,80 @@ sample_hwmon() {
   [[ -n $cpu ]]
 }
 
+# --- macOS (SMC via an optional helper tool) --------------------------------
+# macOS has no /sys or /proc/acpi; temperatures and fan RPM live in the SMC,
+# which an unprivileged process cannot read without a helper. fanwatch uses
+# whichever helper is on PATH, preferring ones that work on both Intel and Apple
+# Silicon: smctemp covers cpu/gpu/fan, istats covers cpu temp + fan (Intel-era),
+# osx-cpu-temp covers cpu temp only, and powermetrics is a sudo fallback for cpu
+# temperature. Override the auto-pick with FANWATCH_MAC_TOOL.
+discover_macos() {
+  MAC_TEMP_TOOL=""; MAC_FAN_TOOL=""; MAC_GPU=0
+  local pick=${FANWATCH_MAC_TOOL:-}
+  if   [[ -n $pick ]] && command -v "$pick"  >/dev/null 2>&1; then MAC_TEMP_TOOL=$pick
+  elif command -v smctemp      >/dev/null 2>&1; then MAC_TEMP_TOOL=smctemp
+  elif command -v istats       >/dev/null 2>&1; then MAC_TEMP_TOOL=istats
+  elif command -v osx-cpu-temp >/dev/null 2>&1; then MAC_TEMP_TOOL=osx-cpu-temp
+  elif command -v powermetrics >/dev/null 2>&1; then MAC_TEMP_TOOL=powermetrics
+  fi
+  case $MAC_TEMP_TOOL in
+    smctemp) MAC_FAN_TOOL=smctemp; MAC_GPU=1 ;;
+    istats)  MAC_FAN_TOOL=istats ;;
+  esac
+  return 0
+}
+
+# Echo a number found on stdin, rounded to a whole integer, so a tool's exact
+# formatting does not matter. Default picks the first number (right for a temp
+# like "61.8°C"); "max" picks the largest, which is right for fan lines that
+# carry an index ("Fan 0: 2345 rpm" -> 2345, not 0). Non-zero when no number.
+mac_round() {
+  local n
+  if [[ ${1:-} == max ]]; then n=$(grep -oE '[0-9]+(\.[0-9]+)?' | sort -rn | head -1)
+  else                         n=$(grep -oE '[0-9]+(\.[0-9]+)?' | head -1); fi
+  [[ -n $n ]] || return 1
+  printf '%.0f' "$n"
+}
+
+# CPU/GPU temperature in whole °C via the detected tool; non-zero if the tool
+# cannot supply that reading (e.g. istats has no GPU sensor).
+mac_temp() {
+  case "$MAC_TEMP_TOOL:$1" in
+    smctemp:cpu)      smctemp -c 2>/dev/null | mac_round ;;
+    smctemp:gpu)      smctemp -g 2>/dev/null | mac_round ;;
+    istats:cpu)       istats cpu temp --value-only 2>/dev/null | mac_round ;;
+    osx-cpu-temp:cpu) osx-cpu-temp 2>/dev/null | mac_round ;;
+    powermetrics:cpu) sudo -n powermetrics --samplers smc -i1 -n1 2>/dev/null \
+                        | grep -i 'CPU die temperature' | mac_round ;;
+    *) return 1 ;;
+  esac
+}
+
+# Fan RPM via the detected tool (first fan if several); non-zero if unavailable.
+mac_fan() {
+  case $MAC_FAN_TOOL in
+    smctemp) smctemp -f 2>/dev/null | mac_round max ;;
+    istats)  istats fan speed --value-only 2>/dev/null | mac_round max ;;
+    *) return 1 ;;
+  esac
+}
+
+sample_macos() {
+  cpu=""; gpu=""; rpm=""; rpmdisp="--"; leveltext="--"; levelcolor=$GR; levelkey=""; fanoff=0
+  cpu=$(mac_temp cpu) || cpu=""
+  (( MAC_GPU )) && { gpu=$(mac_temp gpu) || gpu=""; }
+  if [[ -n $MAC_FAN_TOOL ]]; then
+    rpm=$(mac_fan) || rpm=""
+    if [[ -n $rpm ]]; then
+      rpmdisp=$rpm; levelkey="rpm:$rpm"
+      # No commanded PWM is exposed, so the level column shows on/off from RPM.
+      if (( rpm > 0 )); then leveltext="on"; levelcolor=$Y
+      else                   leveltext="off"; levelcolor=$G; fanoff=1; fi
+    fi
+  fi
+  [[ -n $cpu ]]
+}
+
 sample() { "sample_$BACKEND"; }
 
 # --- colors -----------------------------------------------------------------
@@ -329,6 +407,18 @@ culprit_gpu() {
   | sort -u | paste -sd' · ' -
 }
 
+# macOS CPU culprit: /proc and `top -bn2` are absent, so use ps's recent %CPU
+# (-c gives the clean accounting name, which may contain spaces) aggregated by
+# name. e.g. "Safari 180% · WindowServer 22% · Code 14%"
+culprit_cpu_mac() {
+  ps -Ac -o pcpu,comm 2>/dev/null \
+  | awk 'NR>1 { pc=$1+0; if (pc<1) next; name=$2; for(i=3;i<=NF;i++) name=name" "$i;
+                if (name=="fanwatch"||name=="ps"||name=="awk") next; sum[name]+=pc }
+         END { for (k in sum) printf "%.0f\t%s\n", sum[k], k }' \
+  | sort -rn | head -3 \
+  | awk -F'\t' '{ printf "%s%s %s%%", sep, $2, $1; sep=" · " }'
+}
+
 # When sourced (by the tests), stop here: everything above is definitions and
 # read-only discovery; everything below sets up the terminal, prints, and loops.
 [[ ${BASH_SOURCE[0]} != "$0" ]] && return 0
@@ -340,11 +430,7 @@ culprit_gpu() {
 # active source in the header, OFF_NOTE adds the thinkpad fan-off hint.
 BACKEND=$(detect_backend)
 if ! declare -F "sample_$BACKEND" >/dev/null; then
-  if [[ $BACKEND == macos ]]; then
-    printf 'fanwatch: the macOS backend is not available yet; this build supports thinkpad and hwmon.\n' >&2
-  else
-    printf 'fanwatch: unknown backend %q (set FANWATCH_BACKEND to thinkpad or hwmon)\n' "$BACKEND" >&2
-  fi
+  printf 'fanwatch: unknown backend %q (set FANWATCH_BACKEND to thinkpad, hwmon, or macos)\n' "$BACKEND" >&2
   exit 1
 fi
 
@@ -362,6 +448,13 @@ case $BACKEND in
     [[ -n $HW_CPU ]] || { printf 'fanwatch: no CPU temperature sensor found under %s (set FANWATCH_CPU_TEMP)\n' "${FANWATCH_HWMON_ROOT:-/sys/class/hwmon}" >&2; exit 1; }
     BACKEND_DESC="hwmon: ${HW_CPU_NAME:-cpu}"
     [[ -n $HW_GPU_NAME ]] && BACKEND_DESC+=" + $HW_GPU_NAME"
+    ;;
+  macos)
+    discover_macos
+    OFF_BELOW="${FANWATCH_OFF_BELOW:-55}"
+    [[ -n $MAC_TEMP_TOOL ]] || { printf 'fanwatch: no macOS sensor tool found. Install smctemp, istats or osx-cpu-temp (e.g. brew install smctemp), or run where sudo powermetrics works.\n' >&2; exit 1; }
+    BACKEND_DESC="macos: $MAC_TEMP_TOOL"
+    [[ -n $MAC_FAN_TOOL && $MAC_FAN_TOOL != "$MAC_TEMP_TOOL" ]] && BACKEND_DESC+=" + $MAC_FAN_TOOL"
     ;;
 esac
 
@@ -507,7 +600,7 @@ while :; do
 
   # culprit callout on a meaningful CPU temp rise
   if [[ -n $prev_cpu ]] && (( cpu - prev_cpu >= RISE )); then
-    cpu_blame=$(culprit_cpu)
+    if [[ $BACKEND == macos ]]; then cpu_blame=$(culprit_cpu_mac); else cpu_blame=$(culprit_cpu); fi
     gpu_blame=$(culprit_gpu)
     line="   ${GR}└─ ${Y}▲ +$((cpu - prev_cpu))°C${GR}  likely: ${RST}${cpu_blame:-?}"
     [[ -n $gpu_blame ]] && line+="${GR}  │ gpu: ${RST}${gpu_blame}"

@@ -1,13 +1,13 @@
 # fanwatch
 
-A live terminal monitor for fan speed and temperatures on Linux laptops and
-desktops. It reads from whatever the machine exposes: on a Lenovo ThinkPad it
-uses `thinkpad_acpi` (and pairs with
-[`thinkfan`](https://github.com/vmatare/thinkfan) when present), and on
-everything else it falls back to the generic
-[`hwmon`](https://docs.kernel.org/hwmon/sysfs-interface.html) sysfs interface
-that most laptops and desktops provide. The backend is auto-detected; force one
-with `FANWATCH_BACKEND`.
+A live terminal monitor for fan speed and temperatures on Linux and macOS. It
+reads from whatever the machine exposes: on a Lenovo ThinkPad it uses
+`thinkpad_acpi` (and pairs with
+[`thinkfan`](https://github.com/vmatare/thinkfan) when present), on other Linux
+machines it falls back to the generic
+[`hwmon`](https://docs.kernel.org/hwmon/sysfs-interface.html) sysfs interface,
+and on macOS it reads the SMC through a helper tool. The backend is
+auto-detected; force one with `FANWATCH_BACKEND`.
 
 ![fanwatch output: a pinned header above timestamped rows of CPU and GPU temperatures (green when cool, cyan, yellow, then red as they climb) each with a trend arrow, the fan's commanded level and RPM, and a sparkline of recent CPU history, with callout lines blaming a thermal spike on brave → gnome-shell → claude and tracking the fan as it spins up and later switches off silently](example.svg)
 
@@ -78,7 +78,7 @@ FANWATCH_RISE=5 fanwatch    # only investigate jumps of 5 °C or more
 ## Backends
 
 fanwatch auto-detects the best available source. Override it with
-`FANWATCH_BACKEND=thinkpad` or `FANWATCH_BACKEND=hwmon`.
+`FANWATCH_BACKEND=thinkpad`, `hwmon`, or `macos`.
 
 - **thinkpad** *(preferred when present)* reads `/proc/acpi/ibm/thermal` and
   `/proc/acpi/ibm/fan`, giving named fan levels (`0` … `7` / `full-speed` /
@@ -87,6 +87,12 @@ fanwatch auto-detects the best available source. Override it with
   from `coretemp` / `k10temp` / `zenpower` / `acpitz`, GPU temp from `amdgpu` (or
   `nvidia-smi`), fan RPM from `fan*_input`, and the fan level from `pwm*` shown as
   a percentage of 255.
+- **macos** reads the SMC through a helper tool on your PATH (auto-detected in
+  this order, or forced with `FANWATCH_MAC_TOOL`): [`smctemp`](https://github.com/narugit/smctemp)
+  (CPU/GPU temp and fan, Intel and Apple Silicon), `istats` (CPU temp and fan),
+  `osx-cpu-temp` (CPU temp), or `sudo powermetrics` (CPU temp). Install one, e.g.
+  `brew install smctemp`. macOS exposes no commanded PWM, so the fan column shows
+  `on`/`off` from RPM; fanless Macs report no fan.
 
 On the hwmon backend you can point fanwatch at specific sensors instead of
 letting it auto-detect, by giving sysfs paths:
@@ -97,18 +103,18 @@ FANWATCH_FAN="/sys/class/hwmon/hwmon8/fan1_input /sys/class/hwmon/hwmon8/fan2_in
 FANWATCH_PWM=/sys/class/hwmon/hwmon8/pwm1 fanwatch
 ```
 
-(`FANWATCH_GPU_TEMP` works the same way.) macOS support is planned.
+(`FANWATCH_GPU_TEMP` works the same way.)
 
 ## How it reads things
 
-| Value | thinkpad backend | hwmon backend |
-|-------|------------------|---------------|
-| CPU / GPU temp | `/proc/acpi/ibm/thermal` (fields 1 and 2) | `temp*_input` (millidegrees), labels matched per chip |
-| fan RPM | `/proc/acpi/ibm/fan` `speed:` | `fan*_input` (multiple fans joined `a/b`) |
-| fan level | `/proc/acpi/ibm/fan` `level:` | `pwm*` as a percentage of 255 |
-| off-threshold | parsed from `/etc/thinkfan.yaml` (fallback 58 °C) | `FANWATCH_OFF_BELOW` (default 55 °C) |
-| CPU culprit | `top -bn2` recent %CPU, names via `/proc/<pid>/cmdline`, summed per name | same |
-| GPU culprit | `nvidia-smi pmon -c 1` (works in hybrid/Optimus mode) | same |
+| Value | thinkpad backend | hwmon backend | macos backend |
+|-------|------------------|---------------|---------------|
+| CPU / GPU temp | `/proc/acpi/ibm/thermal` (fields 1 and 2) | `temp*_input` (millidegrees), labels matched per chip | SMC via the helper tool (GPU only on `smctemp`) |
+| fan RPM | `/proc/acpi/ibm/fan` `speed:` | `fan*_input` (multiple fans joined `a/b`) | helper tool (fastest fan) |
+| fan level | `/proc/acpi/ibm/fan` `level:` | `pwm*` as a percentage of 255 | `on`/`off` from RPM (no PWM exposed) |
+| off-threshold | parsed from `/etc/thinkfan.yaml` (fallback 58 °C) | `FANWATCH_OFF_BELOW` (default 55 °C) | `FANWATCH_OFF_BELOW` (default 55 °C) |
+| CPU culprit | `top -bn2` recent %CPU, names via `/proc/<pid>/cmdline`, summed per name | same | `ps -Ac -o pcpu,comm`, summed per name |
+| GPU culprit | `nvidia-smi pmon -c 1` (works in hybrid/Optimus mode) | same | n/a |
 
 Temperature lags load, so the culprit is whatever has been hammering the CPU or
 GPU over the last moment. CPU usage comes from `top`'s second iteration (recent
