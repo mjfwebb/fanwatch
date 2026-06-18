@@ -64,7 +64,7 @@ EOF
 @test "arrow is a blank space when there is no previous sample" {
   source "$FW"
   run arrow 65 ""
-  [ "$output" = "" ]   # a single space, which bats trims to empty
+  [ "$output" = " " ]   # a single space placeholder keeps columns aligned
 }
 
 # --- sparkline: map the CPU history array to block glyphs --------------------
