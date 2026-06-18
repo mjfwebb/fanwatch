@@ -9,6 +9,8 @@ everything else it falls back to the generic
 that most laptops and desktops provide. The backend is auto-detected; force one
 with `FANWATCH_BACKEND`.
 
+![fanwatch output: a pinned header above timestamped rows of CPU and GPU temperatures (green when cool, cyan, yellow, then red as they climb) each with a trend arrow, the fan's commanded level and RPM, and a sparkline of recent CPU history, with callout lines blaming a thermal spike on brave → gnome-shell → claude and tracking the fan as it spins up and later switches off silently](example.svg)
+
 Each refresh shows CPU and GPU temperatures with a trend arrow (`▲` rising,
 `▼` falling, `—` steady) against the previous sample, the current fan RPM, the
 fan's commanded level (a named thinkfan level like `0` / `full-speed` on the
