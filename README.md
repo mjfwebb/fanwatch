@@ -88,3 +88,7 @@ This investigation runs only on a rise, so the steady-state loop stays cheap.
 Tests live in `tests/` and run with
 [bats](https://github.com/bats-core/bats-core) (`bats tests`); CI also runs
 `shellcheck`. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup and conventions.
+
+## License
+
+Released under the [MIT License](LICENSE).
