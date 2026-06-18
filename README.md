@@ -22,6 +22,11 @@ When the fan level changes, fanwatch prints a callout line such as
 the processes most likely responsible:
 `└─ ▲ +13°C  likely: brave 212% · gnome-shell 23% · claude 21%  │ gpu: gnome-shell`.
 
+By default the header is pinned to the top of the terminal while the rows scroll
+beneath it. Press `Shift+Tab` to switch to a scrolling layout that keeps the
+history in your terminal's scrollback, or start there with `--no-sticky` (or
+`FANWATCH_STICKY=0`). `Shift+Tab` toggles between the two while running.
+
 ## Install
 
 One line, no clone needed, and re-running the same line updates an existing
@@ -49,12 +54,14 @@ branch.
 ## Usage
 
 ```bash
-fanwatch        # refresh every 2 s (default)
-fanwatch 5      # refresh every 5 s
-fanwatch update # self-update in place
+fanwatch             # refresh every 2 s (default), header pinned
+fanwatch 5           # refresh every 5 s
+fanwatch --no-sticky # scrolling layout instead of a pinned header
+fanwatch update      # self-update in place
 ```
 
-Press `Ctrl+C` to quit. No root required.
+Press `Ctrl+C` to quit, and `Shift+Tab` to toggle the pinned and scrolling
+layouts while running. No root required.
 
 The rise threshold that triggers culprit attribution is configurable:
 
