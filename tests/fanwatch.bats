@@ -18,6 +18,96 @@ levels:
 EOF
 }
 
+# A synthetic hwmon tree: acpitz (low priority), coretemp with a labelled
+# package sensor, and an amdgpu device carrying the GPU temp, two fans and a PWM.
+# Echoes the tree root. amdgpu is used for the GPU so detection never falls back
+# to nvidia-smi, keeping the result independent of the host.
+make_hwmon() {
+  local root="$BATS_TEST_TMPDIR/hwmon"
+  rm -rf "$root"; mkdir -p "$root"/hwmon0 "$root"/hwmon1 "$root"/hwmon2
+  printf 'acpitz\n' >"$root/hwmon0/name";   printf '70000\n' >"$root/hwmon0/temp1_input"
+  printf 'coretemp\n' >"$root/hwmon1/name"
+  printf 'Package id 0\n' >"$root/hwmon1/temp1_label"; printf '66000\n' >"$root/hwmon1/temp1_input"
+  printf 'Core 0\n'       >"$root/hwmon1/temp2_label"; printf '60000\n' >"$root/hwmon1/temp2_input"
+  printf 'amdgpu\n' >"$root/hwmon2/name"
+  printf 'edge\n'   >"$root/hwmon2/temp1_label"; printf '58000\n' >"$root/hwmon2/temp1_input"
+  printf '1500\n'   >"$root/hwmon2/fan1_input"
+  printf '2000\n'   >"$root/hwmon2/fan2_input"
+  printf '64\n'     >"$root/hwmon2/pwm1"
+  printf '%s' "$root"
+}
+
+# --- detect_backend: explicit override wins ----------------------------------
+
+@test "detect_backend honours FANWATCH_BACKEND" {
+  source "$FW"
+  FANWATCH_BACKEND=hwmon run detect_backend
+  [ "$output" = "hwmon" ]
+}
+
+# --- read_mC: millidegrees -> rounded whole °C -------------------------------
+
+@test "read_mC rounds millidegrees to whole degrees" {
+  source "$FW"
+  printf '66000\n' >"$BATS_TEST_TMPDIR/t"; run read_mC "$BATS_TEST_TMPDIR/t"; [ "$output" = "66" ]
+  printf '66700\n' >"$BATS_TEST_TMPDIR/t"; run read_mC "$BATS_TEST_TMPDIR/t"; [ "$output" = "67" ]
+}
+
+@test "read_mC fails on a missing or non-numeric input" {
+  source "$FW"
+  run read_mC "$BATS_TEST_TMPDIR/nope"; [ "$status" -ne 0 ]
+  printf 'N/A\n' >"$BATS_TEST_TMPDIR/t"; run read_mC "$BATS_TEST_TMPDIR/t"; [ "$status" -ne 0 ]
+}
+
+# --- hwmon_temp_by_label: pick the input matching a label --------------------
+
+@test "hwmon_temp_by_label resolves the input behind a matching label" {
+  source "$FW"; root=$(make_hwmon)
+  run hwmon_temp_by_label "$root/hwmon1" 'Core 0'
+  [ "$output" = "$root/hwmon1/temp2_input" ]
+}
+
+@test "hwmon_temp_by_label falls back to temp1_input when no label matches" {
+  source "$FW"; root=$(make_hwmon)
+  run hwmon_temp_by_label "$root/hwmon1" 'no such label'
+  [ "$output" = "$root/hwmon1/temp1_input" ]
+}
+
+# --- discover_hwmon + sample_hwmon: end to end on the synthetic tree ---------
+
+@test "discover_hwmon prefers coretemp over acpitz and finds fans/pwm/gpu" {
+  source "$FW"; root=$(make_hwmon)
+  discover_hwmon "$root"
+  [ "$HW_CPU_NAME" = "coretemp" ]
+  [ "$HW_CPU" = "$root/hwmon1/temp1_input" ]
+  [ "$HW_GPU" = "$root/hwmon2/temp1_input" ]
+  [ "$HW_GPU_NAME" = "amdgpu" ]
+  [ "${#HW_FANS[@]}" -eq 2 ]
+  [ "$HW_PWM" = "$root/hwmon2/pwm1" ]
+}
+
+@test "sample_hwmon reports temps, joined RPMs and PWM as a percentage" {
+  source "$FW"; root=$(make_hwmon)
+  discover_hwmon "$root"
+  sample_hwmon
+  [ "$cpu" = "66" ]
+  [ "$gpu" = "58" ]
+  [ "$rpm" = "2000" ]            # primary RPM is the fastest fan
+  [ "$rpmdisp" = "1500/2000" ]   # both fans shown, slash-joined
+  [ "$leveltext" = "25%" ]       # 64/255 ~= 25%
+  [ "$fanoff" -eq 0 ]
+}
+
+@test "sample_hwmon flags the fan as off when PWM and RPM are zero" {
+  source "$FW"; root=$(make_hwmon)
+  printf '0\n' >"$root/hwmon2/pwm1"
+  printf '0\n' >"$root/hwmon2/fan1_input"; printf '0\n' >"$root/hwmon2/fan2_input"
+  discover_hwmon "$root"
+  sample_hwmon
+  [ "$fanoff" -eq 1 ]
+  [ "$leveltext" = "0%" ]
+}
+
 # --- parse_off_below: derive the fan-off threshold from thinkfan.yaml --------
 
 @test "parse_off_below takes the lowest non-zero level's lower bound" {

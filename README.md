@@ -1,25 +1,29 @@
 # fanwatch
 
-A live terminal monitor for fan speed and temperatures on a Lenovo ThinkPad
-P15 Gen 2i whose fans are managed by
-[`thinkfan`](https://github.com/vmatare/thinkfan). It reads the same EC sensors
-thinkfan uses, so what you see is what thinkfan is acting on.
+A live terminal monitor for fan speed and temperatures on Linux laptops and
+desktops. It reads from whatever the machine exposes: on a Lenovo ThinkPad it
+uses `thinkpad_acpi` (and pairs with
+[`thinkfan`](https://github.com/vmatare/thinkfan) when present), and on
+everything else it falls back to the generic
+[`hwmon`](https://docs.kernel.org/hwmon/sysfs-interface.html) sysfs interface
+that most laptops and desktops provide. The backend is auto-detected; force one
+with `FANWATCH_BACKEND`.
 
 Each refresh shows CPU and GPU temperatures with a trend arrow (`▲` rising,
-`▼` falling, `—` steady) against the previous sample, the live thinkfan level
-(`0` is off, up to `7` / `full-speed` / `disengaged`) and the current fan RPM,
-and a sparkline of recent CPU history (the last 40 samples, scaled 40 to
-90 °C) so you can see the shape of the trend at a glance.
+`▼` falling, `—` steady) against the previous sample, the current fan RPM, the
+fan's commanded level (a named thinkfan level like `0` / `full-speed` on the
+thinkpad backend, or a PWM percentage on hwmon), and a sparkline of recent CPU
+history (the last 40 samples, scaled 40 to 90 °C).
 
-Temperatures are colour-coded: green below the off-threshold, cyan up to 70 °C,
-yellow to 82 °C, red above. The off-threshold is read automatically from
-`/etc/thinkfan.yaml` (the lowest non-zero fan level's lower bound), so it never
-goes stale when you retune the curve.
+Temperatures are colour-coded: green when cool, cyan up to 70 °C, yellow to
+82 °C, red above. On the thinkpad backend "cool" is read automatically from
+`/etc/thinkfan.yaml` (the lowest non-zero fan level's lower bound), so it tracks
+your fan curve; on the hwmon backend it is `FANWATCH_OFF_BELOW` (default 55 °C).
 
-When the fan level changes, fanwatch prints a callout line such as
-`└─ fan level 2 → 0  ✓ fan OFF (silent)`. When CPU temperature jumps by at least
-`FANWATCH_RISE` °C (default 3) between samples, it prints a culprit line naming
-the processes most likely responsible:
+When the fan turns on or off (and on ThinkPads, on any level change) fanwatch
+prints a callout line such as `└─ fan 2 → 0  ✓ fan OFF (silent)`. When CPU
+temperature jumps by at least `FANWATCH_RISE` °C (default 3) between samples, it
+prints a culprit line naming the processes most likely responsible:
 `└─ ▲ +13°C  likely: brave 212% · gnome-shell 23% · claude 21%  │ gpu: gnome-shell`.
 
 By default the header is pinned to the top of the terminal while the rows scroll
@@ -69,15 +73,40 @@ The rise threshold that triggers culprit attribution is configurable:
 FANWATCH_RISE=5 fanwatch    # only investigate jumps of 5 °C or more
 ```
 
+## Backends
+
+fanwatch auto-detects the best available source. Override it with
+`FANWATCH_BACKEND=thinkpad` or `FANWATCH_BACKEND=hwmon`.
+
+- **thinkpad** *(preferred when present)* reads `/proc/acpi/ibm/thermal` and
+  `/proc/acpi/ibm/fan`, giving named fan levels (`0` … `7` / `full-speed` /
+  `disengaged`) and the thinkfan-derived off-threshold.
+- **hwmon** is the generic Linux fallback. It reads `/sys/class/hwmon`: CPU temp
+  from `coretemp` / `k10temp` / `zenpower` / `acpitz`, GPU temp from `amdgpu` (or
+  `nvidia-smi`), fan RPM from `fan*_input`, and the fan level from `pwm*` shown as
+  a percentage of 255.
+
+On the hwmon backend you can point fanwatch at specific sensors instead of
+letting it auto-detect, by giving sysfs paths:
+
+```bash
+FANWATCH_CPU_TEMP=/sys/class/hwmon/hwmon7/temp1_input \
+FANWATCH_FAN="/sys/class/hwmon/hwmon8/fan1_input /sys/class/hwmon/hwmon8/fan2_input" \
+FANWATCH_PWM=/sys/class/hwmon/hwmon8/pwm1 fanwatch
+```
+
+(`FANWATCH_GPU_TEMP` works the same way.) macOS support is planned.
+
 ## How it reads things
 
-| Value | Source |
-|-------|--------|
-| CPU / GPU temp | `/proc/acpi/ibm/thermal` (fields 1 and 2) |
-| fan level & RPM | `/proc/acpi/ibm/fan` (`level:` / `speed:` lines) |
-| off-threshold | parsed from `/etc/thinkfan.yaml` levels (fallback 58 °C) |
-| CPU culprit | `top -bn2` recent %CPU, names via `/proc/<pid>/cmdline`, summed per name |
-| GPU culprit | `nvidia-smi pmon -c 1` (works in hybrid/Optimus mode) |
+| Value | thinkpad backend | hwmon backend |
+|-------|------------------|---------------|
+| CPU / GPU temp | `/proc/acpi/ibm/thermal` (fields 1 and 2) | `temp*_input` (millidegrees), labels matched per chip |
+| fan RPM | `/proc/acpi/ibm/fan` `speed:` | `fan*_input` (multiple fans joined `a/b`) |
+| fan level | `/proc/acpi/ibm/fan` `level:` | `pwm*` as a percentage of 255 |
+| off-threshold | parsed from `/etc/thinkfan.yaml` (fallback 58 °C) | `FANWATCH_OFF_BELOW` (default 55 °C) |
+| CPU culprit | `top -bn2` recent %CPU, names via `/proc/<pid>/cmdline`, summed per name | same |
+| GPU culprit | `nvidia-smi pmon -c 1` (works in hybrid/Optimus mode) | same |
 
 Temperature lags load, so the culprit is whatever has been hammering the CPU or
 GPU over the last moment. CPU usage comes from `top`'s second iteration (recent

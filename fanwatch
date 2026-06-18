@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# fanwatch - live ThinkPad fan/temperature monitor for the P15 (thinkfan-managed)
-# Shows CPU/GPU EC temps with trend arrows, a sparkline of recent CPU history,
-# the live thinkfan level + RPM, and a callout whenever the fan level changes.
+# fanwatch - live fan/temperature monitor for Linux laptops and desktops.
+# Shows CPU/GPU temps with trend arrows, a sparkline of recent CPU history, the
+# live fan level/RPM, and a callout whenever the fan state changes. Reads from
+# thinkpad_acpi (/proc/acpi/ibm) when present, else the generic hwmon sysfs
+# interface; pick explicitly with FANWATCH_BACKEND. See `fanwatch --help`.
 #
 # Usage: fanwatch [interval_seconds] [--sticky|--no-sticky]   (default 2s, pinned)
 #        fanwatch update                                       (self-update in place)
@@ -42,6 +44,14 @@ Options:
 Environment:
   FANWATCH_STICKY=0   start in the scrolling layout (same as --no-sticky)
   FANWATCH_RISE=N     investigate CPU jumps of N°C or more (default 3)
+  FANWATCH_BACKEND=X  force a backend: thinkpad | hwmon (default: auto-detect)
+  FANWATCH_OFF_BELOW=N  green below N°C in the hwmon backend (default 55; the
+                      thinkpad backend derives this from thinkfan.yaml instead)
+
+  Sensor overrides (hwmon backend; give a sysfs path to skip auto-detection):
+  FANWATCH_CPU_TEMP, FANWATCH_GPU_TEMP   e.g. /sys/class/hwmon/hwmon7/temp1_input
+  FANWATCH_FAN        one or more fan*_input paths (space-separated)
+  FANWATCH_PWM        a pwm* path, shown as a percentage of 255
 
 While running, Shift+Tab toggles between the pinned and scrolling layouts.
 EOF
@@ -63,17 +73,34 @@ while (( $# )); do
   esac
 done
 
-FAN=/proc/acpi/ibm/fan
-THERMAL=/proc/acpi/ibm/thermal
-CONFIG=/etc/thinkfan.yaml
-
 # Investigate the likely culprit when CPU temp jumps by at least this many °C
 # between samples (override with FANWATCH_RISE).
 RISE="${FANWATCH_RISE:-3}"
 
-# Derive the off-threshold straight from thinkfan's config so it never goes
-# stale: the fan drops to level 0 once temps fall below the LOWER bound of the
-# lowest non-zero level. Parse each "- [level, lower, upper]" entry, skip
+# --- backend ----------------------------------------------------------------
+# fanwatch reads CPU/GPU temperature, fan RPM and the fan's commanded level from
+# whatever the platform exposes. thinkpad_acpi (/proc/acpi/ibm) is preferred
+# when present: it names fan levels and pairs with thinkfan's config. Otherwise
+# the generic Linux hwmon sysfs interface is used, which works on most laptops
+# and desktops. FANWATCH_BACKEND forces the pick. Each backend defines a
+# sample_<name> that fills the per-tick globals the loop prints (cpu, gpu, rpm,
+# rpmdisp, leveltext, levelcolor, levelkey, fanoff) and returns non-zero when
+# there is no CPU reading.
+OS=$(uname -s 2>/dev/null || echo Linux)
+IBM_FAN=/proc/acpi/ibm/fan
+IBM_THERMAL=/proc/acpi/ibm/thermal
+THINKFAN_CONFIG="${FANWATCH_THINKFAN_CONFIG:-/etc/thinkfan.yaml}"
+
+detect_backend() {
+  [[ -n ${FANWATCH_BACKEND:-} ]] && { printf '%s' "$FANWATCH_BACKEND"; return; }
+  [[ $OS == Darwin ]]                && { printf 'macos';    return; }
+  [[ -r $IBM_FAN && -r $IBM_THERMAL ]] && { printf 'thinkpad'; return; }
+  printf 'hwmon'
+}
+
+# Derive the thinkpad off-threshold straight from thinkfan's config so it never
+# goes stale: the fan drops to level 0 once temps fall below the LOWER bound of
+# the lowest non-zero level. Parse each "- [level, lower, upper]" entry, skip
 # level 0, and take the smallest lower bound. Falls back to 58 if unreadable.
 parse_off_below() {
   local config=$1 v
@@ -89,7 +116,141 @@ parse_off_below() {
   [[ "$v" =~ ^[0-9]+$ ]] || v=58
   printf '%s' "$v"
 }
-OFF_BELOW=$(parse_off_below "$CONFIG")
+
+# --- hwmon discovery --------------------------------------------------------
+# Echo a hwmon device dir whose name matches a regex (first match wins).
+hwmon_dir_by_name() {
+  local root=$1 want=$2 d n
+  for d in "$root"/hwmon*; do
+    [[ -r $d/name ]] || continue
+    read -r n < "$d/name"
+    [[ $n =~ $want ]] && { printf '%s' "$d"; return; }
+  done
+}
+
+# Echo the temp*_input under a dir whose temp*_label matches a regex; fall back
+# to temp1_input. Echoes nothing if the dir has no usable temperature input.
+hwmon_temp_by_label() {
+  local dir=$1 want=$2 lf inp
+  for lf in "$dir"/temp*_label; do
+    [[ -r $lf ]] || continue
+    if grep -qiE "$want" "$lf" 2>/dev/null; then
+      inp="${lf%_label}_input"
+      [[ -r $inp ]] && { printf '%s' "$inp"; return; }
+    fi
+  done
+  [[ -r $dir/temp1_input ]] && printf '%s' "$dir/temp1_input"
+}
+
+# Resolve CPU temp, GPU temp, fan RPM input(s) and a PWM node from the hwmon
+# tree. Honours the FANWATCH_* path overrides; sets HW_CPU/HW_GPU/HW_FANS/HW_PWM
+# and the friendly source names used in the header.
+discover_hwmon() {
+  local root=$1 d
+  HW_CPU=""; HW_GPU=""; HW_PWM=""; HW_CPU_NAME=""; HW_GPU_NAME=""; HW_FANS=()
+
+  [[ -n ${FANWATCH_CPU_TEMP:-} ]] && { HW_CPU=$FANWATCH_CPU_TEMP; HW_CPU_NAME=custom; }
+  [[ -n ${FANWATCH_GPU_TEMP:-} ]] && { HW_GPU=$FANWATCH_GPU_TEMP; HW_GPU_NAME=custom; }
+
+  if [[ -z $HW_CPU ]]; then
+    if   d=$(hwmon_dir_by_name "$root" '^coretemp$');            [[ -n $d ]]; then HW_CPU=$(hwmon_temp_by_label "$d" 'Package id')
+    elif d=$(hwmon_dir_by_name "$root" '^(k10temp|zenpower)$');  [[ -n $d ]]; then HW_CPU=$(hwmon_temp_by_label "$d" 'Tctl|Tdie')
+    elif d=$(hwmon_dir_by_name "$root" 'cpu[-_]?thermal|soc[-_]?thermal'); [[ -n $d ]]; then HW_CPU=$(hwmon_temp_by_label "$d" 'cpu')
+    elif d=$(hwmon_dir_by_name "$root" '^thinkpad$');            [[ -n $d ]]; then HW_CPU=$(hwmon_temp_by_label "$d" '^CPU$')
+    elif d=$(hwmon_dir_by_name "$root" '^acpitz$');              [[ -n $d ]]; then HW_CPU=$d/temp1_input
+    fi
+    [[ -n $d && -r $d/name ]] && read -r HW_CPU_NAME < "$d/name"
+  fi
+
+  if [[ -z $HW_GPU ]]; then
+    if   d=$(hwmon_dir_by_name "$root" '^amdgpu$');   [[ -n $d ]]; then HW_GPU=$(hwmon_temp_by_label "$d" 'edge'); HW_GPU_NAME=amdgpu
+    elif d=$(hwmon_dir_by_name "$root" '^thinkpad$'); [[ -n $d ]]; then HW_GPU=$(hwmon_temp_by_label "$d" '^GPU$'); HW_GPU_NAME=thinkpad
+    elif command -v nvidia-smi >/dev/null 2>&1;       then HW_GPU=nvidia-smi; HW_GPU_NAME=nvidia
+    fi
+  fi
+
+  if [[ -n ${FANWATCH_FAN:-} ]]; then
+    read -ra HW_FANS <<< "$FANWATCH_FAN"
+  else
+    local f fans
+    for d in "$root"/hwmon*; do
+      fans=("$d"/fan*_input)
+      [[ -r ${fans[0]} ]] || continue
+      for f in "${fans[@]}"; do [[ -r $f ]] && HW_FANS+=("$f"); done
+      [[ -z $HW_PWM && -r $d/pwm1 ]] && HW_PWM=$d/pwm1
+      break
+    done
+  fi
+  [[ -n ${FANWATCH_PWM:-} ]] && HW_PWM=$FANWATCH_PWM
+  return 0
+}
+
+# Read a hwmon temperature input (millidegrees) as whole °C, rounded. Returns
+# non-zero (echoing nothing) when the path is unreadable or not a number.
+read_mC() {
+  local f=$1 v
+  [[ -r $f ]] || return 1
+  read -r v < "$f" 2>/dev/null || return 1
+  [[ $v =~ ^-?[0-9]+$ ]] || return 1
+  printf '%d' "$(( (v + 500) / 1000 ))"
+}
+
+# --- per-backend samplers ---------------------------------------------------
+sample_thinkpad() {
+  cpu=""; gpu=""; rpm=""; rpmdisp="--"; leveltext="--"; levelcolor=$GR; levelkey=""; fanoff=0
+  read -r cpu gpu _ < <(awk -F'\t' '/^temperatures:/{print $2}' "$IBM_THERMAL" | awk '{print $1, $2}')
+  local level speed
+  level=$(awk '/^level:/{print $2}' "$IBM_FAN")
+  speed=$(awk '/^speed:/{print $2}' "$IBM_FAN")
+  rpm=$speed; rpmdisp=${speed:---}
+  levelkey=$level
+  if   [[ $level == "0" ]];                            then leveltext="0 (off)"; levelcolor=$G; fanoff=1
+  elif [[ $level == "full-speed" || $level == "7" ]];  then leveltext=$level;     levelcolor=$R
+  else                                                      leveltext=$level;     levelcolor=$Y; fi
+  [[ -n $cpu ]]
+}
+
+sample_hwmon() {
+  cpu=""; gpu=""; rpm=""; rpmdisp="--"; leveltext="--"; levelcolor=$GR; levelkey=""; fanoff=0
+  cpu=$(read_mC "$HW_CPU") || cpu=""
+  if [[ $HW_GPU == nvidia-smi ]]; then
+    gpu=$(nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits 2>/dev/null | head -1)
+    [[ $gpu =~ ^[0-9]+$ ]] || gpu=""
+  elif [[ -n $HW_GPU ]]; then
+    gpu=$(read_mC "$HW_GPU") || gpu=""
+  fi
+
+  local f v max="" parts=()
+  for f in "${HW_FANS[@]}"; do
+    [[ -r $f ]] || continue
+    read -r v < "$f" 2>/dev/null || continue
+    [[ $v =~ ^[0-9]+$ ]] || continue
+    parts+=("$v"); { [[ -z $max ]] || (( v > max )); } && max=$v
+  done
+  if (( ${#parts[@]} )); then
+    rpm=$max
+    local IFS=/; rpmdisp="${parts[*]}"
+  fi
+
+  if [[ -n $HW_PWM && -r $HW_PWM ]]; then
+    read -r v < "$HW_PWM" 2>/dev/null
+    if [[ $v =~ ^[0-9]+$ ]]; then
+      local pct=$(( (v*100 + 127) / 255 ))
+      leveltext="${pct}%"; levelkey=$pct
+      if   (( pct == 0 )); then levelcolor=$G
+      elif (( pct < 50 )); then levelcolor=$C
+      elif (( pct < 80 )); then levelcolor=$Y
+      else                      levelcolor=$R; fi
+    fi
+  fi
+
+  if   [[ -n $rpm ]];      then (( rpm == 0 )) && fanoff=1
+  elif [[ $levelkey == 0 ]]; then fanoff=1; fi
+  [[ -z $levelkey && -n $rpm ]] && levelkey="rpm:$rpm"
+  [[ -n $cpu ]]
+}
+
+sample() { "sample_$BACKEND"; }
 
 # --- colors -----------------------------------------------------------------
 if [[ -t 1 ]]; then
@@ -172,6 +333,38 @@ culprit_gpu() {
 # read-only discovery; everything below sets up the terminal, prints, and loops.
 [[ ${BASH_SOURCE[0]} != "$0" ]] && return 0
 
+# --- backend setup ----------------------------------------------------------
+# Pick the backend, then resolve its sensors and the coloring threshold. OFF_BELOW
+# is the temperature below which a CPU reading is "cool" (green): thinkfan derives
+# it from its config; hwmon uses FANWATCH_OFF_BELOW. BACKEND_DESC labels the
+# active source in the header, OFF_NOTE adds the thinkpad fan-off hint.
+BACKEND=$(detect_backend)
+if ! declare -F "sample_$BACKEND" >/dev/null; then
+  if [[ $BACKEND == macos ]]; then
+    printf 'fanwatch: the macOS backend is not available yet; this build supports thinkpad and hwmon.\n' >&2
+  else
+    printf 'fanwatch: unknown backend %q (set FANWATCH_BACKEND to thinkpad or hwmon)\n' "$BACKEND" >&2
+  fi
+  exit 1
+fi
+
+OFF_NOTE=""
+case $BACKEND in
+  thinkpad)
+    OFF_BELOW=$(parse_off_below "$THINKFAN_CONFIG")
+    BACKEND_DESC="thinkpad_acpi"
+    [[ -r $THINKFAN_CONFIG ]] && BACKEND_DESC="thinkpad_acpi + thinkfan"
+    OFF_NOTE=", fan off < ${OFF_BELOW}°C"
+    ;;
+  hwmon)
+    discover_hwmon "${FANWATCH_HWMON_ROOT:-/sys/class/hwmon}"
+    OFF_BELOW="${FANWATCH_OFF_BELOW:-55}"
+    [[ -n $HW_CPU ]] || { printf 'fanwatch: no CPU temperature sensor found under %s (set FANWATCH_CPU_TEMP)\n' "${FANWATCH_HWMON_ROOT:-/sys/class/hwmon}" >&2; exit 1; }
+    BACKEND_DESC="hwmon: ${HW_CPU_NAME:-cpu}"
+    [[ -n $HW_GPU_NAME ]] && BACKEND_DESC+=" + $HW_GPU_NAME"
+    ;;
+esac
+
 # --- terminal dimensions ----------------------------------------------------
 # COLS/ROWS are the usable width/height, or 0 when output is not a terminal (no
 # pinned header there). A WINCH trap refreshes them on resize, so we only shell
@@ -223,10 +416,10 @@ build_header() {
     else                       printf -v tag '%s↕ SCROLLING%s' "$Y" "$RST"; fi
     printf -v keys '   %s  %sShift+Tab toggles%s' "$tag" "$GR" "$RST"
   fi
-  printf -v h0 '%sfanwatch%s  every %ss, Ctrl+C to quit   (fan turns OFF when EC CPU < %s°C)%s' \
-    "$BOLD" "$RST" "$interval" "$OFF_BELOW" "$keys"
-  printf -v h1 '%s%-8s  %-7s  %-7s  %-12s  %-7s  %s%s' \
-    "$GR" "time" "CPU" "GPU" "fan level" "rpm" "cpu trend (40-90°C)" "$RST"
+  printf -v h0 '%sfanwatch%s  every %ss, Ctrl+C to quit   (%s%s)%s' \
+    "$BOLD" "$RST" "$interval" "$BACKEND_DESC" "$OFF_NOTE" "$keys"
+  printf -v h1 '%s%-8s  %-7s  %-7s  %-11s  %-9s  %s%s' \
+    "$GR" "time" "CPU" "GPU" "fan" "rpm" "cpu trend (40-90°C)" "$RST"
   hdr_lines=("$h0" "$h1")
 }
 
@@ -288,28 +481,28 @@ idle() {
 }
 
 # --- main loop --------------------------------------------------------------
-prev_cpu=""; prev_gpu=""; prev_level=""; rows_since_hdr=0
+prev_cpu=""; prev_gpu=""; prev_levelkey=""; prev_leveltext=""; prev_fanoff=0; rows_since_hdr=0
 
 while :; do
-  read -r cpu gpu _ < <(awk -F'\t' '/^temperatures:/{print $2}' "$THERMAL" | awk '{print $1, $2}')
-  level=$(awk '/^level:/{print $2}' "$FAN")
-  speed=$(awk '/^speed:/{print $2}' "$FAN")
-  [[ -z $cpu ]] && { idle; continue; }
+  sample || { idle; continue; }   # fills cpu/gpu/rpm/level*; non-zero if no CPU
   ts=$(date +%H:%M:%S)
 
   # track CPU history for the sparkline (keep last 40)
   hist+=("$cpu"); (( ${#hist[@]} > 40 )) && hist=("${hist[@]: -40}")
 
-  # fan level styling: level 0 = off (green/silent), full-speed = red
-  if [[ $level == "0" ]]; then lvldisp="${G}0 (off)${RST}    "
-  elif [[ $level == "full-speed" || $level == "7" ]]; then lvldisp="${R}${level}${RST}        "
-  else lvldisp="${Y}${level}${RST}           "; fi
-
-  printf '%s%-8s%s  %s%2s°C%s %s  %s%2s°C%s %s  %b  %5s    %s\n' \
-    "$GR" "$ts" "$RST" \
-    "$(tcolor "$cpu")" "$cpu" "$RST" "$(arrow "$cpu" "$prev_cpu")" \
-    "$(tcolor "$gpu")" "$gpu" "$RST" "$(arrow "$gpu" "$prev_gpu")" \
-    "$lvldisp" "$speed" "$(sparkline)"
+  # Assemble the row from coloured segments so the GPU column can drop out when
+  # the backend has no GPU sensor, and so the level field pads on its plain text
+  # (the colour codes around it would otherwise throw off %-Ns width counting).
+  printf -v f_time '%s%-8s%s' "$GR" "$ts" "$RST"
+  printf -v f_cpu  '%s%2s°C%s %s' "$(tcolor "$cpu")" "$cpu" "$RST" "$(arrow "$cpu" "$prev_cpu")"
+  if [[ -n $gpu ]]; then
+    printf -v f_gpu '%s%2s°C%s %s' "$(tcolor "$gpu")" "$gpu" "$RST" "$(arrow "$gpu" "$prev_gpu")"
+  else
+    printf -v f_gpu '%s  --   %s' "$GR" "$RST"
+  fi
+  printf -v f_lvl '%s%-11s%s' "$levelcolor" "$leveltext" "$RST"
+  printf -v f_rpm '%-9s' "$rpmdisp"
+  printf '%s  %s  %s  %s  %s  %s\n' "$f_time" "$f_cpu" "$f_gpu" "$f_lvl" "$f_rpm" "$(sparkline)"
   printed=1
 
   # culprit callout on a meaningful CPU temp rise
@@ -321,15 +514,22 @@ while :; do
     printf '%s%s\n' "$line" "$RST"; (( printed++ ))
   fi
 
-  # callout when the fan level changes
-  if [[ -n $prev_level && $level != "$prev_level" ]]; then
-    if [[ $level == "0" ]]; then
-      printf '   %s└─ fan level %s → %s%s%s  ✓ fan OFF (silent)%s\n' "$GR" "$prev_level" "$BOLD$G" "$level" "$RST$GR" "$RST"
-    else
-      dir="changed"; [[ $prev_level == "0" ]] && dir="spun up"
-      printf '   %s└─ fan level %s → %s%s%s  (%s)%s\n' "$GR" "$prev_level" "$BOLD" "$level" "$RST$GR" "$dir" "$RST"
+  # Callout when the fan state changes. Always report an off<->on transition; on
+  # the thinkpad backend also report every discrete level change (2 -> 4 etc).
+  # The hwmon PWM% wiggles tick to tick, so only its off<->on edges are flagged.
+  if [[ -n $prev_levelkey ]]; then
+    changed=0
+    if   (( fanoff != prev_fanoff )); then changed=1
+    elif [[ $BACKEND == thinkpad && $levelkey != "$prev_levelkey" ]]; then changed=1; fi
+    if (( changed )); then
+      if (( fanoff )); then
+        printf '   %s└─ fan %s → %s%s%s  ✓ fan OFF (silent)%s\n' "$GR" "$prev_leveltext" "$BOLD$G" "$leveltext" "$RST$GR" "$RST"
+      else
+        dir="changed"; (( prev_fanoff )) && dir="spun up"
+        printf '   %s└─ fan %s → %s%s%s  (%s)%s\n' "$GR" "$prev_leveltext" "$BOLD" "$leveltext" "$RST$GR" "$dir" "$RST"
+      fi
+      (( printed++ ))
     fi
-    (( printed++ ))
   fi
 
   # Scroll mode on a terminal: once a screenful of rows has gone by, reprint the
@@ -341,6 +541,7 @@ while :; do
     if (( rows_since_hdr >= screenful )); then render_header; rows_since_hdr=0; fi
   fi
 
-  prev_cpu=$cpu; prev_gpu=$gpu; prev_level=$level
+  prev_cpu=$cpu; prev_gpu=$gpu
+  prev_levelkey=$levelkey; prev_leveltext=$leveltext; prev_fanoff=$fanoff
   idle
 done
