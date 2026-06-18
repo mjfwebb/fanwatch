@@ -3,8 +3,9 @@
 # Shows CPU/GPU EC temps with trend arrows, a sparkline of recent CPU history,
 # the live thinkfan level + RPM, and a callout whenever the fan level changes.
 #
-# Usage: fanwatch [interval_seconds]   (default 2)
-#        fanwatch update               (self-update in place)
+# Usage: fanwatch [interval_seconds] [--sticky|--no-sticky]   (default 2s, pinned)
+#        fanwatch update                                       (self-update in place)
+#        fanwatch --help
 
 export LC_ALL=C
 
@@ -26,7 +27,42 @@ if [[ ${1:-} == update ]]; then
   exit $?
 fi
 
-interval="${1:-2}"
+# --- options ----------------------------------------------------------------
+print_help() {
+  cat <<'EOF'
+Usage: fanwatch [interval_seconds] [options]
+       fanwatch update                  self-update in place
+
+Options:
+  --sticky        pin the header to the top of the terminal (default)
+  --no-sticky     let the output scroll naturally, keeping scrollback
+  --scroll        alias for --no-sticky
+  -h, --help      show this help and exit
+
+Environment:
+  FANWATCH_STICKY=0   start in the scrolling layout (same as --no-sticky)
+  FANWATCH_RISE=N     investigate CPU jumps of N°C or more (default 3)
+
+While running, Shift+Tab toggles between the pinned and scrolling layouts.
+EOF
+}
+
+# Pin the header by default (FANWATCH_STICKY=1); --no-sticky/--scroll or
+# FANWATCH_STICKY=0 starts in the scrollback-friendly layout instead. Either way
+# Shift+Tab flips between the two live.
+STICKY_PREF="${FANWATCH_STICKY:-1}"
+interval=2
+while (( $# )); do
+  case $1 in
+    --sticky)             STICKY_PREF=1; shift;;
+    --no-sticky|--scroll) STICKY_PREF=0; shift;;
+    -h|--help)            print_help; exit 0;;
+    --)                   shift; break;;
+    -*)                   printf 'fanwatch: unknown option %s (try --help)\n' "$1" >&2; exit 2;;
+    *)                    interval=$1; shift;;
+  esac
+done
+
 FAN=/proc/acpi/ibm/fan
 THERMAL=/proc/acpi/ibm/thermal
 CONFIG=/etc/thinkfan.yaml
@@ -132,25 +168,133 @@ culprit_gpu() {
   | sort -u | paste -sd' · ' -
 }
 
-cleanup() { printf '%s\n' "$RST"; exit 0; }
-
 # When sourced (by the tests), stop here: everything above is definitions and
-# read-only discovery; the header and loop below would otherwise run on source.
+# read-only discovery; everything below sets up the terminal, prints, and loops.
 [[ ${BASH_SOURCE[0]} != "$0" ]] && return 0
 
+# --- terminal dimensions ----------------------------------------------------
+# COLS/ROWS are the usable width/height, or 0 when output is not a terminal (no
+# pinned header there). A WINCH trap refreshes them on resize, so we only shell
+# out to tput then.
+COLS=0; ROWS=0
+get_dims() {
+  [[ -t 1 ]] || { COLS=0; ROWS=0; return; }
+  # tput can fail (TERM unset/dumb) or report 0; fall back to the shell's
+  # COLUMNS/LINES, then 80x24. COLS must never be 0 on a terminal: it would be
+  # indistinguishable from "not a terminal" and disable the pinned layout.
+  local c r
+  c=$(tput cols  2>/dev/null); [[ $c =~ ^[1-9][0-9]*$ ]] || c=${COLUMNS-}; [[ $c =~ ^[1-9][0-9]*$ ]] && COLS=$c || COLS=80
+  r=$(tput lines 2>/dev/null); [[ $r =~ ^[1-9][0-9]*$ ]] || r=${LINES-};   [[ $r =~ ^[1-9][0-9]*$ ]] && ROWS=$r || ROWS=24
+}
+get_dims
+
+# --- keyboard ---------------------------------------------------------------
+# The Shift+Tab hotkey needs single keypresses (non-canonical, no-echo input)
+# and bash 5 for the EPOCHREALTIME-paced idle below. Enable it only on a real
+# terminal (not under the tests or a pipe). Save the termios to restore on exit.
+KB=0; STTY_SAVE=""
+if (( BASH_VERSINFO[0] >= 5 )) && [[ -t 0 ]] && STTY_SAVE=$(stty -g 2>/dev/null); then
+  stty -icanon -echo 2>/dev/null && KB=1
+fi
+restore_tty() { (( KB )) && [[ -n $STTY_SAVE ]] && stty "$STTY_SAVE" 2>/dev/null; }
+trap restore_tty EXIT
+
+STICKY=0
+cleanup() {
+  # Release the scroll region and drop the cursor below the data before resetting
+  # color, so the shell prompt returns under the output rather than over the
+  # pinned header. The tty mode is restored separately by the EXIT trap above.
+  (( STICKY )) && printf '\e[r\e[%d;1H' "$ROWS"
+  printf '%s\n' "$RST"
+  exit 0
+}
 trap cleanup INT TERM
 
-prev_cpu=""; prev_gpu=""; prev_level=""
-printf '%sfanwatch%s  every %ss — Ctrl+C to quit   (fan turns OFF when EC CPU < %s°C)\n' \
-  "$BOLD" "$RST" "$interval" "$OFF_BELOW"
-printf '%s%-8s  %-7s  %-7s  %-12s  %-7s  %s%s\n' \
-  "$GR" "time" "CPU" "GPU" "fan level" "rpm" "cpu trend (40–90°C)" "$RST"
+# --- header -----------------------------------------------------------------
+# Build the two header lines into hdr_lines[]. Kept in a function because the
+# pinned layout reprints it on resize and on a live toggle. The layout tag (cyan
+# PINNED vs yellow SCROLLING) reflects FANWATCH_STICKY, i.e. the mode the toggle
+# currently selects, so a Shift+Tab press is unmistakable.
+hdr_lines=()
+build_header() {
+  local keys="" tag h0 h1
+  if (( COLS != 0 )); then
+    if (( STICKY_PREF )); then printf -v tag '%s▔ PINNED%s'    "$C" "$RST"
+    else                       printf -v tag '%s↕ SCROLLING%s' "$Y" "$RST"; fi
+    printf -v keys '   %s  %sShift+Tab toggles%s' "$tag" "$GR" "$RST"
+  fi
+  printf -v h0 '%sfanwatch%s  every %ss, Ctrl+C to quit   (fan turns OFF when EC CPU < %s°C)%s' \
+    "$BOLD" "$RST" "$interval" "$OFF_BELOW" "$keys"
+  printf -v h1 '%s%-8s  %-7s  %-7s  %-12s  %-7s  %s%s' \
+    "$GR" "time" "CPU" "GPU" "fan level" "rpm" "cpu trend (40-90°C)" "$RST"
+  hdr_lines=("$h0" "$h1")
+}
+
+# Paint the header. HDR_ROWS records its height for the scroll-mode reprint
+# cadence. In pinned mode (sticky preferred, on a terminal with rows to spare):
+# clear the screen, print the header at the top, then confine scrolling to the
+# rows below it with a DECSTBM scroll region, so data scrolls under a fixed
+# header (rows that scroll past are lost to scrollback). Otherwise print it
+# inline and let everything scroll; the main loop then reprints it each screenful
+# so it stays visible while old rows remain in the terminal's scrollback.
+HDR_ROWS=0
+render_header() {
+  build_header
+  HDR_ROWS=${#hdr_lines[@]}
+  if (( ! STICKY_PREF )) || (( COLS == 0 )) || (( ROWS <= HDR_ROWS + 1 )); then
+    STICKY=0
+    printf '%s\n' "${hdr_lines[@]}"
+    return
+  fi
+  STICKY=1
+  printf '\e[H\e[2J'                            # home + clear screen
+  printf '%s\n' "${hdr_lines[@]}"               # header occupies rows 1..HDR_ROWS
+  printf '\e[%d;%dr' "$((HDR_ROWS+1))" "$ROWS"  # scroll region: below header .. bottom
+  printf '\e[%d;1H' "$((HDR_ROWS+1))"           # park the cursor at its top
+}
+
+# A resize refreshes the dimensions; pinned mode also repaints to re-establish
+# the scroll region. Scroll mode just adopts the new size on its next screenful.
+winch_handler() { get_dims; (( STICKY )) && render_header; }
+render_header
+trap winch_handler WINCH
+
+# Flip the layout live (Shift+Tab). Leaving pinned mode releases the scroll
+# region first; render_header then repaints in whichever mode is now selected.
+toggle_sticky() {
+  (( STICKY_PREF = ! STICKY_PREF ))
+  (( STICKY )) && printf '\e[r'      # drop the old scroll region before repaint
+  rows_since_hdr=0
+  render_header
+}
+
+# Idle until the next tick. On a keyboard terminal, poll stdin instead of
+# sleeping so Shift+Tab (ESC [ Z) is handled promptly; a read timeout means the
+# interval elapsed. Without a keyboard, just sleep.
+idle() {
+  (( KB )) || { sleep "$interval"; return; }
+  local deadline to key rest
+  deadline=$(awk -v n="$EPOCHREALTIME" -v i="$interval" 'BEGIN{printf "%.3f", n+i}')
+  while :; do
+    to=$(awk -v d="$deadline" -v n="$EPOCHREALTIME" \
+         'BEGIN{r=d-n; if(r<=0) print "x"; else printf "%.3f", r}')
+    [[ $to == x ]] && break                       # reached the deadline -> tick
+    IFS= read -rsN1 -t "$to" key || break          # timeout/EOF -> tick now
+    if [[ $key == $'\e' ]]; then                  # CSI? Shift+Tab is ESC [ Z
+      IFS= read -rsN2 -t 0.05 rest
+      [[ $rest == '[Z' ]] && toggle_sticky
+    fi
+  done
+}
+
+# --- main loop --------------------------------------------------------------
+prev_cpu=""; prev_gpu=""; prev_level=""; rows_since_hdr=0
 
 while :; do
   read -r cpu gpu _ < <(awk -F'\t' '/^temperatures:/{print $2}' "$THERMAL" | awk '{print $1, $2}')
   level=$(awk '/^level:/{print $2}' "$FAN")
   speed=$(awk '/^speed:/{print $2}' "$FAN")
-  [[ -z $cpu ]] && { sleep "$interval"; continue; }
+  [[ -z $cpu ]] && { idle; continue; }
   ts=$(date +%H:%M:%S)
 
   # track CPU history for the sparkline (keep last 40)
@@ -166,6 +310,7 @@ while :; do
     "$(tcolor "$cpu")" "$cpu" "$RST" "$(arrow "$cpu" "$prev_cpu")" \
     "$(tcolor "$gpu")" "$gpu" "$RST" "$(arrow "$gpu" "$prev_gpu")" \
     "$lvldisp" "$speed" "$(sparkline)"
+  printed=1
 
   # culprit callout on a meaningful CPU temp rise
   if [[ -n $prev_cpu ]] && (( cpu - prev_cpu >= RISE )); then
@@ -173,7 +318,7 @@ while :; do
     gpu_blame=$(culprit_gpu)
     line="   ${GR}└─ ${Y}▲ +$((cpu - prev_cpu))°C${GR}  likely: ${RST}${cpu_blame:-?}"
     [[ -n $gpu_blame ]] && line+="${GR}  │ gpu: ${RST}${gpu_blame}"
-    printf '%s%s\n' "$line" "$RST"
+    printf '%s%s\n' "$line" "$RST"; (( printed++ ))
   fi
 
   # callout when the fan level changes
@@ -184,8 +329,18 @@ while :; do
       dir="changed"; [[ $prev_level == "0" ]] && dir="spun up"
       printf '   %s└─ fan level %s → %s%s%s  (%s)%s\n' "$GR" "$prev_level" "$BOLD" "$level" "$RST$GR" "$dir" "$RST"
     fi
+    (( printed++ ))
+  fi
+
+  # Scroll mode on a terminal: once a screenful of rows has gone by, reprint the
+  # header inline so it stays in view while the rows it scrolled past remain in
+  # the terminal's scrollback. (Pinned mode's scroll region handles this itself.)
+  if (( ! STICKY && COLS > 0 )); then
+    screenful=$(( ROWS - HDR_ROWS )); (( screenful < 1 )) && screenful=1
+    (( rows_since_hdr += printed ))
+    if (( rows_since_hdr >= screenful )); then render_header; rows_since_hdr=0; fi
   fi
 
   prev_cpu=$cpu; prev_gpu=$gpu; prev_level=$level
-  sleep "$interval"
+  idle
 done
