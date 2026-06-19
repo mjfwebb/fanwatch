@@ -320,10 +320,17 @@ mac_temp() {
   esac
 }
 
-# Fan RPM via the detected tool (fastest fan if several); non-zero if unavailable.
+# Fan RPM via the detected tool (fastest fan if several); non-zero if
+# unavailable. smctemp has no fan flag (its -f is "fail-soft mode", not fan), so
+# read the SMC's actual-RPM keys from its full key dump instead: F0Ac, F1Ac, …
+# carry the live per-fan speed. The "[flt ]" type tag contains a space, so split
+# on the closing ']' and take the value after it. exit 1 when no F*Ac key is
+# present (fanless Macs) so the caller shows no fan rather than a bogus 0.
 mac_fan() {
   case $MAC_FAN_TOOL in
-    smctemp) smctemp -f 2>/dev/null | mac_round max ;;
+    smctemp) smctemp -l 2>/dev/null | awk -F']' '
+               /^[[:space:]]*F[0-9]+Ac[[:space:]]/ { seen=1; v=$2+0; if (v>m) m=v }
+               END { if (!seen) exit 1; printf "%.0f\n", m+0 }' ;;
     istats)  istats fan speed --value-only 2>/dev/null | mac_round max ;;
     *) return 1 ;;
   esac
