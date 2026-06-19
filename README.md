@@ -90,7 +90,7 @@ fanwatch auto-detects the best available source. Override it with
 - **macos** reads the SMC through a helper tool on your PATH (auto-detected in
   this order, or forced with `FANWATCH_MAC_TOOL`): [`smctemp`](https://github.com/narugit/smctemp)
   (CPU/GPU temp and fan, Intel and Apple Silicon), `istats` (CPU temp and fan),
-  `osx-cpu-temp` (CPU temp), or `sudo powermetrics` (CPU temp, **Intel only** —
+  `osx-cpu-temp` (CPU temp), or `sudo powermetrics` (CPU temp, **Intel only**;
   it is skipped during auto-detection on Apple Silicon, where its sampler does
   not expose the CPU die temperature). None ship with macOS, so install one:
 

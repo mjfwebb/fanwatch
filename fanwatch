@@ -271,12 +271,16 @@ sample_hwmon() {
 # line, which the smc sampler only emits on Intel Macs. On Apple Silicon
 # (uname -m = arm64) that line is absent, so auto-detection skips powermetrics
 # there rather than picking a tool that yields no reading and leaves the loop
-# blank — better to fall through to the "no usable helper" error with install
+# blank; better to fall through to the "no usable helper" error with install
 # hints. An explicit FANWATCH_MAC_TOOL=powermetrics is still honoured.
 discover_macos() {
   MAC_TEMP_TOOL=""; MAC_FAN_TOOL=""; MAC_GPU=0
   local pick=${FANWATCH_MAC_TOOL:-} arch
   arch=$(uname -m 2>/dev/null || echo unknown)
+  # A forced FANWATCH_MAC_TOOL that isn't on PATH shouldn't silently auto-pick a
+  # different helper; warn, then fall through to auto-detection.
+  [[ -n $pick ]] && ! command -v "$pick" >/dev/null 2>&1 \
+    && printf 'fanwatch: FANWATCH_MAC_TOOL=%q not found on PATH; auto-detecting instead.\n' "$pick" >&2
   if   [[ -n $pick ]] && command -v "$pick"  >/dev/null 2>&1; then MAC_TEMP_TOOL=$pick
   elif command -v smctemp      >/dev/null 2>&1; then MAC_TEMP_TOOL=smctemp
   elif command -v istats       >/dev/null 2>&1; then MAC_TEMP_TOOL=istats
@@ -316,7 +320,7 @@ mac_temp() {
   esac
 }
 
-# Fan RPM via the detected tool (first fan if several); non-zero if unavailable.
+# Fan RPM via the detected tool (fastest fan if several); non-zero if unavailable.
 mac_fan() {
   case $MAC_FAN_TOOL in
     smctemp) smctemp -f 2>/dev/null | mac_round max ;;

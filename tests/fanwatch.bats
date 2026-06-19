@@ -171,7 +171,7 @@ EOF
   [ -z "$MAC_TEMP_TOOL" ]
 }
 
-# But an explicit FANWATCH_MAC_TOOL=powermetrics is still honoured on arm64 —
+# But an explicit FANWATCH_MAC_TOOL=powermetrics is still honoured on arm64;
 # the skip is only about the auto-pick, not a hard block.
 @test "discover_macos honours an explicit powermetrics pick on Apple Silicon" {
   source "$FW"
