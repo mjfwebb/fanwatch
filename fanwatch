@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# fanwatch - live fan/temperature monitor for Linux laptops and desktops.
+# fanwatch - live fan/temperature monitor for Linux and macOS laptops/desktops.
 # Shows CPU/GPU temps with trend arrows, a sparkline of recent CPU history, the
 # live fan level/RPM, and a callout whenever the fan state changes. Reads from
 # thinkpad_acpi (/proc/acpi/ibm) when present, else the generic hwmon sysfs
-# interface; pick explicitly with FANWATCH_BACKEND. See `fanwatch --help`.
+# interface; on macOS it reads the SMC through a helper tool on PATH. Pick a
+# backend explicitly with FANWATCH_BACKEND. See `fanwatch --help`.
 #
 # Usage: fanwatch [interval_seconds] [--sticky|--no-sticky]   (default 2s, pinned)
 #        fanwatch update                                       (self-update in place)
@@ -53,9 +54,13 @@ Environment:
   FANWATCH_FAN        one or more fan*_input paths (space-separated)
   FANWATCH_PWM        a pwm* path, shown as a percentage of 255
 
-  macOS (reads the SMC via a helper tool on PATH):
+  macOS (reads the SMC via a helper tool on PATH; install one if none found):
   FANWATCH_MAC_TOOL=T force the helper: smctemp | istats | osx-cpu-temp |
-                      powermetrics (default: first of those found)
+                      powermetrics (default: first of those found).
+                      smctemp:      brew tap narugit/tap && brew install narugit/tap/smctemp
+                      osx-cpu-temp: brew install osx-cpu-temp
+                      istats:       gem install iStats
+                      (powermetrics is preinstalled but Intel-only and needs sudo)
 
 While running, Shift+Tab toggles between the pinned and scrolling layouts.
 EOF
@@ -261,14 +266,22 @@ sample_hwmon() {
 # Silicon: smctemp covers cpu/gpu/fan, istats covers cpu temp + fan (Intel-era),
 # osx-cpu-temp covers cpu temp only, and powermetrics is a sudo fallback for cpu
 # temperature. Override the auto-pick with FANWATCH_MAC_TOOL.
+#
+# powermetrics is special-cased: its parser keys off the "CPU die temperature"
+# line, which the smc sampler only emits on Intel Macs. On Apple Silicon
+# (uname -m = arm64) that line is absent, so auto-detection skips powermetrics
+# there rather than picking a tool that yields no reading and leaves the loop
+# blank — better to fall through to the "no usable helper" error with install
+# hints. An explicit FANWATCH_MAC_TOOL=powermetrics is still honoured.
 discover_macos() {
   MAC_TEMP_TOOL=""; MAC_FAN_TOOL=""; MAC_GPU=0
-  local pick=${FANWATCH_MAC_TOOL:-}
+  local pick=${FANWATCH_MAC_TOOL:-} arch
+  arch=$(uname -m 2>/dev/null || echo unknown)
   if   [[ -n $pick ]] && command -v "$pick"  >/dev/null 2>&1; then MAC_TEMP_TOOL=$pick
   elif command -v smctemp      >/dev/null 2>&1; then MAC_TEMP_TOOL=smctemp
   elif command -v istats       >/dev/null 2>&1; then MAC_TEMP_TOOL=istats
   elif command -v osx-cpu-temp >/dev/null 2>&1; then MAC_TEMP_TOOL=osx-cpu-temp
-  elif command -v powermetrics >/dev/null 2>&1; then MAC_TEMP_TOOL=powermetrics
+  elif [[ $arch != arm64 ]] && command -v powermetrics >/dev/null 2>&1; then MAC_TEMP_TOOL=powermetrics
   fi
   case $MAC_TEMP_TOOL in
     smctemp) MAC_FAN_TOOL=smctemp; MAC_GPU=1 ;;
@@ -452,7 +465,21 @@ case $BACKEND in
   macos)
     discover_macos
     OFF_BELOW="${FANWATCH_OFF_BELOW:-55}"
-    [[ -n $MAC_TEMP_TOOL ]] || { printf 'fanwatch: no macOS sensor tool found. Install smctemp, istats or osx-cpu-temp (e.g. brew install smctemp), or run where sudo powermetrics works.\n' >&2; exit 1; }
+    # No helper on PATH means no SMC reading at all. Don't auto-install anything
+    # (fanwatch otherwise only reads sensors and needs no setup); instead name
+    # each helper and its exact install command so the user can pick one. These
+    # commands are easy to get wrong: smctemp lives in a tap (not core), istats
+    # is a Ruby gem (not brew), and powermetrics needs sudo and only reports a
+    # CPU temperature on Intel.
+    if [[ -z $MAC_TEMP_TOOL ]]; then
+      printf 'fanwatch: no macOS sensor helper found on PATH. Install one of:\n' >&2
+      printf '  smctemp       CPU/GPU temp + fan (Intel & Apple Silicon):  brew tap narugit/tap && brew install narugit/tap/smctemp\n' >&2
+      printf '  osx-cpu-temp  CPU temp only:                               brew install osx-cpu-temp\n' >&2
+      printf '  istats        CPU temp + fan (Intel-era):                  gem install iStats\n' >&2
+      printf '  powermetrics  CPU temp only, Intel + sudo (preinstalled)\n' >&2
+      printf 'then re-run fanwatch, or set FANWATCH_MAC_TOOL to force one.\n' >&2
+      exit 1
+    fi
     BACKEND_DESC="macos: $MAC_TEMP_TOOL"
     [[ -n $MAC_FAN_TOOL && $MAC_FAN_TOOL != "$MAC_TEMP_TOOL" ]] && BACKEND_DESC+=" + $MAC_FAN_TOOL"
     ;;

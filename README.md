@@ -90,9 +90,19 @@ fanwatch auto-detects the best available source. Override it with
 - **macos** reads the SMC through a helper tool on your PATH (auto-detected in
   this order, or forced with `FANWATCH_MAC_TOOL`): [`smctemp`](https://github.com/narugit/smctemp)
   (CPU/GPU temp and fan, Intel and Apple Silicon), `istats` (CPU temp and fan),
-  `osx-cpu-temp` (CPU temp), or `sudo powermetrics` (CPU temp). Install one, e.g.
-  `brew install smctemp`. macOS exposes no commanded PWM, so the fan column shows
-  `on`/`off` from RPM; fanless Macs report no fan.
+  `osx-cpu-temp` (CPU temp), or `sudo powermetrics` (CPU temp, **Intel only** —
+  it is skipped during auto-detection on Apple Silicon, where its sampler does
+  not expose the CPU die temperature). None ship with macOS, so install one:
+
+  ```bash
+  brew tap narugit/tap && brew install narugit/tap/smctemp   # recommended
+  brew install osx-cpu-temp                                  # CPU temp only
+  gem install iStats                                         # istats (a Ruby gem)
+  ```
+
+  fanwatch prints these same hints if it starts and finds no helper. macOS
+  exposes no commanded PWM, so the fan column shows `on`/`off` from RPM; fanless
+  Macs (and Apple Silicon with no fan sensor) report no fan.
 
 On the hwmon backend you can point fanwatch at specific sensors instead of
 letting it auto-detect, by giving sysfs paths:

@@ -154,6 +154,33 @@ EOF
   [ "$MAC_GPU" -eq 0 ]
 }
 
+# Auto-detection must skip powermetrics on Apple Silicon (its smc sampler has no
+# "CPU die temperature" line there), so a machine with only powermetrics ends up
+# with no tool and triggers the install-hints error rather than a blank loop. A
+# stub `uname` forces arm64 independently of the host, and an empty PATH (plus
+# the stub dir) guarantees no real helper is found.
+@test "discover_macos skips powermetrics on Apple Silicon" {
+  source "$FW"
+  dir="$BATS_TEST_TMPDIR/arm"; mkdir -p "$dir"
+  printf '#!/usr/bin/env bash\necho arm64\n' >"$dir/uname"
+  printf '#!/usr/bin/env bash\nexit 0\n'     >"$dir/powermetrics"
+  chmod +x "$dir/uname" "$dir/powermetrics"
+  PATH="$dir" discover_macos
+  [ -z "$MAC_TEMP_TOOL" ]
+}
+
+# But an explicit FANWATCH_MAC_TOOL=powermetrics is still honoured on arm64 —
+# the skip is only about the auto-pick, not a hard block.
+@test "discover_macos honours an explicit powermetrics pick on Apple Silicon" {
+  source "$FW"
+  dir="$BATS_TEST_TMPDIR/arm2"; mkdir -p "$dir"
+  printf '#!/usr/bin/env bash\necho arm64\n' >"$dir/uname"
+  printf '#!/usr/bin/env bash\nexit 0\n'     >"$dir/powermetrics"
+  chmod +x "$dir/uname" "$dir/powermetrics"
+  PATH="$dir" FANWATCH_MAC_TOOL=powermetrics discover_macos
+  [ "$MAC_TEMP_TOOL" = "powermetrics" ]
+}
+
 @test "sample_macos parses smctemp temps and the fastest fan" {
   source "$FW"; PATH="$(make_mac_tools):$PATH"; discover_macos
   sample_macos
