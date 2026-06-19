@@ -109,8 +109,11 @@ make_hwmon() {
 }
 
 # Fake macOS sensor helpers on a temp dir, returned for prepending to PATH.
-# smctemp covers cpu/gpu/fan (fan output carries an index to exercise parsing);
-# istats covers cpu temp + fan only.
+# smctemp covers cpu/gpu/fan; istats covers cpu temp + fan only. smctemp has no
+# fan flag, so its fan RPM is read from the SMC key dump (-l): the F<n>Ac keys
+# carry actual per-fan RPM, formatted "F0Ac  [flt ]  <rpm> (bytes: ...)". The
+# mock reproduces that layout (including the unrelated keys real -l prints, and
+# the space inside the "[flt ]" tag) so the parser is exercised faithfully.
 make_mac_tools() {
   local dir="$BATS_TEST_TMPDIR/macbin"; mkdir -p "$dir"
   cat >"$dir/smctemp" <<'EOF'
@@ -118,7 +121,7 @@ make_mac_tools() {
 case "$1" in
   -c) echo "61.8" ;;
   -g) echo "47.2°C" ;;
-  -f) printf 'Fan 0: 2345 rpm\nFan 1: 3010 rpm\n' ;;
+  -l) printf '  TC0P  [flt ]  61.8 (bytes: ..)\n  F0Ac  [flt ]  2345.0 (bytes: ..)\n  F1Ac  [flt ]  3010.0 (bytes: ..)\n' ;;
 esac
 EOF
   cat >"$dir/istats" <<'EOF'
@@ -204,11 +207,25 @@ EOF
 @test "sample_macos flags the fan as off at zero rpm" {
   source "$FW"
   dir="$BATS_TEST_TMPDIR/macoff"; mkdir -p "$dir"
-  printf '#!/usr/bin/env bash\ncase "$1" in -c) echo 40 ;; -f) echo 0 ;; esac\n' >"$dir/smctemp"
+  printf '#!/usr/bin/env bash\ncase "$1" in -c) echo 40 ;; -l) printf "  F0Ac  [flt ]  0.0 (bytes: ..)\\n" ;; esac\n' >"$dir/smctemp"
   chmod +x "$dir/smctemp"; PATH="$dir:$PATH"; discover_macos
   sample_macos
   [ "$fanoff" -eq 1 ]
   [ "$leveltext" = "off" ]
+}
+
+# A fanless Mac (e.g. a MacBook with no fan) exposes no F*Ac keys at all, so
+# mac_fan returns non-zero and the row shows no fan rather than a bogus 0 rpm.
+@test "sample_macos shows no fan when the SMC exposes no fan keys" {
+  source "$FW"
+  dir="$BATS_TEST_TMPDIR/macfanless"; mkdir -p "$dir"
+  printf '#!/usr/bin/env bash\ncase "$1" in -c) echo 45 ;; -l) printf "  TC0P  [flt ]  45.0 (bytes: ..)\\n" ;; esac\n' >"$dir/smctemp"
+  chmod +x "$dir/smctemp"; PATH="$dir:$PATH"; discover_macos
+  sample_macos
+  [ "$cpu" = "45" ]
+  [ -z "$rpm" ]
+  [ "$rpmdisp" = "--" ]
+  [ "$leveltext" = "--" ]
 }
 
 # --- parse_off_below: derive the fan-off threshold from thinkfan.yaml --------
