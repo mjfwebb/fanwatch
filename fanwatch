@@ -391,12 +391,13 @@ sample_macos() {
 # "//" in the URL) and PowerShell "$" variables untouched. It prints one line,
 # "<cpu°C> <gpu°C> <rpm> <ctl%>", each rounded to a whole number or "-" when that
 # sensor is absent: CPU package temp (preferring "CPU Package", then Tctl/Tdie),
-# GPU core temp, the fastest fan's RPM, and the highest fan-control percentage.
+# GPU temp (preferring "GPU Core", else any GPU temperature), the fastest fan's
+# RPM, and the highest fan-control percentage.
 # shellcheck disable=SC2016  # the $-tokens are PowerShell variables, not shell
 WIN_SAMPLE_PS='
 $ErrorActionPreference="SilentlyContinue"
 $d=Invoke-RestMethod -Uri $env:LHM_URL -TimeoutSec 4
-$cpuPkg="";$cpuTctl="";$cpuAny="";$gpu="";$rpm=$null;$ctl=$null
+$cpuPkg="";$cpuTctl="";$cpuAny="";$gpuCore="";$gpuAny="";$rpm=$null;$ctl=$null
 function num($v){ if($v){ ($v -replace "[^0-9.,]","") -replace ",","." } }
 function dv($s){ if($s){ try{[double]::Parse($s,[Globalization.CultureInfo]::InvariantCulture)}catch{$null} } else {$null} }
 function Walk($n){
@@ -406,7 +407,10 @@ function Walk($n){
         if($n.Text -eq "CPU Package"){$script:cpuPkg=num $n.Value}
         elseif($n.Text -match "Tctl|Tdie"){$script:cpuTctl=num $n.Value}
         if($script:cpuAny -eq ""){$script:cpuAny=num $n.Value}
-      } elseif($n.SensorId -match "gpu" -and $n.Text -match "GPU Core"){$script:gpu=num $n.Value}
+      } elseif($n.SensorId -match "gpu"){
+        if($n.Text -match "GPU Core"){$script:gpuCore=num $n.Value}
+        elseif(-not $script:gpuAny){$script:gpuAny=num $n.Value}
+      }
     }
     "Fan"{ $f=dv (num $n.Value); if($f -ne $null -and ($script:rpm -eq $null -or $f -gt $script:rpm)){$script:rpm=$f} }
     "Control"{ $c=dv (num $n.Value); if($c -ne $null -and ($script:ctl -eq $null -or $c -gt $script:ctl)){$script:ctl=$c} }
@@ -415,6 +419,7 @@ function Walk($n){
 }
 if($d){ Walk $d }
 $cpu=if($cpuPkg){$cpuPkg}elseif($cpuTctl){$cpuTctl}else{$cpuAny}
+$gpu=if($gpuCore){$gpuCore}else{$gpuAny}
 function r($v){ if($v -eq $null){"-"}else{[string][int][math]::Round([double]$v)} }
 "{0} {1} {2} {3}" -f (r (dv $cpu)),(r (dv $gpu)),(r $rpm),(r $ctl)
 '
@@ -575,14 +580,18 @@ culprit_cpu_win() {
     foreach($p in Get-Process){
       if($a.ContainsKey($p.Id) -and $p.CPU -ne $null){
         $dt=$p.CPU-$a[$p.Id]
-        if($dt -gt 0 -and $p.Name -ne "fanwatch"){ $d[$p.Name]=$d[$p.Name]+$dt }
+        # Exclude the powershell/pwsh process running this very sampler (it burns
+        # CPU during the 300ms window and would otherwise top its own list), as
+        # culprit_cpu/_mac exclude their own top/ps/awk tooling.
+        if($dt -gt 0 -and $p.Name -notin @("powershell","pwsh","fanwatch")){ $d[$p.Name]=$d[$p.Name]+$dt }
       }
     }
     $d.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 3 | ForEach-Object {
       "{0} {1}" -f $_.Name,([int][math]::Round($_.Value*100/0.3))
     }
   ' 2>/dev/null | tr -d '\r' \
-  | awk 'NF { printf "%s%s %s%%", sep, $1, $2; sep=" · " }'
+  | awk 'NF { pct=$NF; name=$1; for(i=2;i<NF;i++) name=name" "$i;
+              printf "%s%s %s%%", sep, name, pct; sep=" · " }'
 }
 
 # When sourced (by the tests), stop here: everything above is definitions and
@@ -596,7 +605,7 @@ culprit_cpu_win() {
 # active source in the header, OFF_NOTE adds the thinkpad fan-off hint.
 BACKEND=$(detect_backend)
 if ! declare -F "sample_$BACKEND" >/dev/null; then
-  printf 'fanwatch: unknown backend %q (set FANWATCH_BACKEND to thinkpad, hwmon, or macos)\n' "$BACKEND" >&2
+  printf 'fanwatch: unknown backend %q (set FANWATCH_BACKEND to thinkpad, hwmon, macos, or windows)\n' "$BACKEND" >&2
   exit 1
 fi
 
