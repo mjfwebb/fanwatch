@@ -228,6 +228,51 @@ EOF
   [ "$leveltext" = "--" ]
 }
 
+# --- windows backend (LibreHardwareMonitor reading, parsed by win_apply) -----
+# The PowerShell that reads LHM can't run in CI, so the spawn (win_read) is
+# exercised by hand on Windows; here we test the pure parser it feeds, win_apply,
+# and that a Windows shell selects the backend.
+
+@test "detect_backend picks windows under a Windows shell" {
+  source "$FW"
+  OS=Linux WIN_SHELL=1 run detect_backend
+  [ "$output" = "windows" ]
+}
+
+@test "win_apply parses cpu/gpu/rpm and a control percentage" {
+  source "$FW"
+  win_apply "66 58 2000 45"
+  [ "$cpu" = "66" ]
+  [ "$gpu" = "58" ]
+  [ "$rpm" = "2000" ]
+  [ "$rpmdisp" = "2000" ]
+  [ "$leveltext" = "45%" ]      # highest fan-control percentage
+  [ "$fanoff" -eq 0 ]
+}
+
+@test "win_apply shows on/off from rpm when no control sensor is present" {
+  source "$FW"
+  win_apply "70 - 1500 -"
+  [ "$cpu" = "70" ]
+  [ -z "$gpu" ]                 # "-" means the sensor was absent
+  [ "$rpm" = "1500" ]
+  [ "$leveltext" = "on" ]
+  [ "$fanoff" -eq 0 ]
+}
+
+@test "win_apply flags the fan off at zero rpm and zero control" {
+  source "$FW"
+  win_apply "55 - 0 0"
+  [ "$leveltext" = "0%" ]
+  [ "$fanoff" -eq 1 ]
+}
+
+@test "win_apply returns non-zero when there is no cpu reading" {
+  source "$FW"
+  run win_apply "- - - -"
+  [ "$status" -ne 0 ]
+}
+
 # --- parse_off_below: derive the fan-off threshold from thinkfan.yaml --------
 
 @test "parse_off_below takes the lowest non-zero level's lower bound" {
