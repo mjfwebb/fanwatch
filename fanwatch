@@ -392,12 +392,14 @@ sample_macos() {
 # "<cpu°C> <gpu°C> <rpm> <ctl%>", each rounded to a whole number or "-" when that
 # sensor is absent: CPU package temp (preferring "CPU Package", then Tctl/Tdie),
 # GPU temp (preferring "GPU Core", else any GPU temperature), the fastest fan's
-# RPM, and the highest fan-control percentage.
+# RPM, and the highest fan-control percentage among headers whose tach spins
+# (unused headers stuck at 100% are skipped).
 # shellcheck disable=SC2016  # the $-tokens are PowerShell variables, not shell
 WIN_SAMPLE_PS='
 $ErrorActionPreference="SilentlyContinue"
 $d=Invoke-RestMethod -Uri $env:LHM_URL -TimeoutSec 4
 $cpuPkg="";$cpuTctl="";$cpuAny="";$gpuCore="";$gpuAny="";$rpm=$null;$ctl=$null
+$fanRpm=@{};$ctlList=@()
 function num($v){ if($v){ ($v -replace "[^0-9.,]","") -replace ",","." } }
 function dv($s){ if($s){ try{[double]::Parse($s,[Globalization.CultureInfo]::InvariantCulture)}catch{$null} } else {$null} }
 function Walk($n){
@@ -412,16 +414,20 @@ function Walk($n){
         elseif(-not $script:gpuAny){$script:gpuAny=num $n.Value}
       }
     }
-    "Fan"{ $f=dv (num $n.Value); if($f -ne $null -and ($script:rpm -eq $null -or $f -gt $script:rpm)){$script:rpm=$f} }
-    "Control"{ $c=dv (num $n.Value); if($c -ne $null -and ($script:ctl -eq $null -or $c -gt $script:ctl)){$script:ctl=$c} }
+    "Fan"{ $f=dv (num $n.Value); if($f -ne $null){ $k=($n.SensorId -replace "/(fan|control)/","/"); $script:fanRpm[$k]=$f; if($script:rpm -eq $null -or $f -gt $script:rpm){$script:rpm=$f} } }
+    "Control"{ $c=dv (num $n.Value); if($c -ne $null){ $k=($n.SensorId -replace "/(fan|control)/","/"); $script:ctlList += ,@{k=$k;c=$c} } }
   }
   foreach($x in $n.Children){ Walk $x }
 }
 if($d){ Walk $d }
+# Only count a fan-control duty whose paired tach (same hardware path/index)
+# actually spins: motherboards expose unused fan headers stuck at 100%, which
+# would otherwise masquerade as the loudest fan.
+foreach($e in $ctlList){ $rp=$fanRpm[$e.k]; if($rp -ne $null -and $rp -gt 0 -and ($ctl -eq $null -or $e.c -gt $ctl)){$ctl=$e.c} }
 $cpu=if($cpuPkg){$cpuPkg}elseif($cpuTctl){$cpuTctl}else{$cpuAny}
 $gpu=if($gpuCore){$gpuCore}else{$gpuAny}
-function r($v){ if($v -eq $null){"-"}else{[string][int][math]::Round([double]$v)} }
-"{0} {1} {2} {3}" -f (r (dv $cpu)),(r (dv $gpu)),(r $rpm),(r $ctl)
+function Rnd($v){ if($v -eq $null){"-"}else{[string][int][math]::Round([double]$v)} }
+"{0} {1} {2} {3}" -f (Rnd (dv $cpu)),(Rnd (dv $gpu)),(Rnd $rpm),(Rnd $ctl)
 '
 
 # One PowerShell spawn -> the "<cpu> <gpu> <rpm> <ctl>" line above. LHM_URL is
