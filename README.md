@@ -1,13 +1,15 @@
 # fanwatch
 
-A live terminal monitor for fan speed and temperatures on Linux and macOS. It
-reads from whatever the machine exposes: on a Lenovo ThinkPad it uses
+A live terminal monitor for fan speed and temperatures on Linux, macOS and
+Windows. It reads from whatever the machine exposes: on a Lenovo ThinkPad it uses
 `thinkpad_acpi` (and pairs with
 [`thinkfan`](https://github.com/vmatare/thinkfan) when present), on other Linux
 machines it falls back to the generic
-[`hwmon`](https://docs.kernel.org/hwmon/sysfs-interface.html) sysfs interface,
-and on macOS it reads the SMC through a helper tool. The backend is
-auto-detected; force one with `FANWATCH_BACKEND`.
+[`hwmon`](https://docs.kernel.org/hwmon/sysfs-interface.html) sysfs interface, on
+macOS it reads the SMC through a helper tool, and on Windows it reads
+[LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor)'s
+web server through PowerShell. The backend is auto-detected; force one with
+`FANWATCH_BACKEND`.
 
 ![fanwatch output: a pinned header above timestamped rows of CPU and GPU temperatures (green when cool, cyan, yellow, then red as they climb) each with a trend arrow, the fan's commanded level and RPM, and a sparkline of recent CPU history, with callout lines blaming a thermal spike on brave → gnome-shell → claude and tracking the fan as it spins up and later switches off silently](example.svg)
 
@@ -43,8 +45,9 @@ curl -fsSL https://raw.githubusercontent.com/mjfwebb/fanwatch/main/install.sh | 
 ```
 
 It installs to `~/.local/bin` (override with `FANWATCH_BIN_DIR`), which must be
-on your PATH. fanwatch only reads `/proc` and `/sys`, so it needs no root and no
-udev setup.
+on your PATH. On Linux and macOS fanwatch only reads sensors, so it needs no root
+and no udev setup. On Windows, run the same line from **Git Bash** or **WSL**
+(see the [windows backend](#backends) for the LibreHardwareMonitor setup).
 
 From a checkout instead:
 
@@ -78,7 +81,7 @@ FANWATCH_RISE=5 fanwatch    # only investigate jumps of 5 °C or more
 ## Backends
 
 fanwatch auto-detects the best available source. Override it with
-`FANWATCH_BACKEND=thinkpad`, `hwmon`, or `macos`.
+`FANWATCH_BACKEND=thinkpad`, `hwmon`, `macos`, or `windows`.
 
 - **thinkpad** *(preferred when present)* reads `/proc/acpi/ibm/thermal` and
   `/proc/acpi/ibm/fan`, giving named fan levels (`0` … `7` / `full-speed` /
@@ -103,6 +106,25 @@ fanwatch auto-detects the best available source. Override it with
   fanwatch prints these same hints if it starts and finds no helper. macOS
   exposes no commanded PWM, so the fan column shows `on`/`off` from RPM; fanless
   Macs (and Apple Silicon with no fan sensor) report no fan.
+- **windows** reads sensors from
+  [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor)
+  (LHM). fanwatch is a bash script, so run it from a bash shell — **Git Bash**
+  (ships with [Git for Windows](https://gitforwindows.org/)) or **WSL** — not
+  `cmd` or PowerShell. Run LHM **as administrator** and turn on its web server
+  (*Options → Remote Web Server → Run*; default port 8085). fanwatch then queries
+  it through `powershell.exe`, walking the sensor tree once per tick for the CPU
+  package temperature (preferring `CPU Package`, then `Tctl`/`Tdie`), the GPU core
+  temperature, the fastest fan's RPM, and the highest fan-control percentage. The
+  PowerShell runs on the Windows side, so `localhost:8085` is reachable even from
+  WSL. Point it at a different URL with `FANWATCH_LHM_URL`:
+
+  ```bash
+  FANWATCH_LHM_URL=http://localhost:9000/data.json fanwatch
+  ```
+
+  If LHM isn't running, its web server is off, or it lacks the admin rights to
+  read CPU sensors, fanwatch says so on startup rather than showing a blank
+  screen.
 
 On the hwmon backend you can point fanwatch at specific sensors instead of
 letting it auto-detect, by giving sysfs paths:
@@ -117,14 +139,14 @@ FANWATCH_PWM=/sys/class/hwmon/hwmon8/pwm1 fanwatch
 
 ## How it reads things
 
-| Value | thinkpad backend | hwmon backend | macos backend |
-|-------|------------------|---------------|---------------|
-| CPU / GPU temp | `/proc/acpi/ibm/thermal` (fields 1 and 2) | `temp*_input` (millidegrees), labels matched per chip | SMC via the helper tool (GPU only on `smctemp`) |
-| fan RPM | `/proc/acpi/ibm/fan` `speed:` | `fan*_input` (multiple fans joined `a/b`) | helper tool (fastest fan) |
-| fan level | `/proc/acpi/ibm/fan` `level:` | `pwm*` as a percentage of 255 | `on`/`off` from RPM (no PWM exposed) |
-| off-threshold | parsed from `/etc/thinkfan.yaml` (fallback 58 °C) | `FANWATCH_OFF_BELOW` (default 55 °C) | `FANWATCH_OFF_BELOW` (default 55 °C) |
-| CPU culprit | `top -bn2` recent %CPU, names via `/proc/<pid>/cmdline`, summed per name | same | `ps -Ac -o pcpu,comm`, summed per name |
-| GPU culprit | `nvidia-smi pmon -c 1` (works in hybrid/Optimus mode) | same | n/a |
+| Value | thinkpad backend | hwmon backend | macos backend | windows backend |
+|-------|------------------|---------------|---------------|-----------------|
+| CPU / GPU temp | `/proc/acpi/ibm/thermal` (fields 1 and 2) | `temp*_input` (millidegrees), labels matched per chip | SMC via the helper tool (GPU only on `smctemp`) | LHM `Temperature` sensors (CPU `Package`/`Tctl`, GPU `Core`) |
+| fan RPM | `/proc/acpi/ibm/fan` `speed:` | `fan*_input` (multiple fans joined `a/b`) | helper tool (fastest fan) | LHM `Fan` sensors (fastest fan) |
+| fan level | `/proc/acpi/ibm/fan` `level:` | `pwm*` as a percentage of 255 | `on`/`off` from RPM (no PWM exposed) | LHM `Control` sensor as a percentage (else `on`/`off` from RPM) |
+| off-threshold | parsed from `/etc/thinkfan.yaml` (fallback 58 °C) | `FANWATCH_OFF_BELOW` (default 55 °C) | `FANWATCH_OFF_BELOW` (default 55 °C) | `FANWATCH_OFF_BELOW` (default 55 °C) |
+| CPU culprit | `top -bn2` recent %CPU, names via `/proc/<pid>/cmdline`, summed per name | same | `ps -Ac -o pcpu,comm`, summed per name | `Get-Process` CPU-time delta over 0.3 s, summed per name |
+| GPU culprit | `nvidia-smi pmon -c 1` (works in hybrid/Optimus mode) | same | n/a | `nvidia-smi` if on PATH |
 
 Temperature lags load, so the culprit is whatever has been hammering the CPU or
 GPU over the last moment. CPU usage comes from `top`'s second iteration (recent

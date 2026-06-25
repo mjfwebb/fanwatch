@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# fanwatch - live fan/temperature monitor for Linux and macOS laptops/desktops.
+# fanwatch - live fan/temperature monitor for Linux, macOS and Windows.
 # Shows CPU/GPU temps with trend arrows, a sparkline of recent CPU history, the
 # live fan level/RPM, and a callout whenever the fan state changes. Reads from
 # thinkpad_acpi (/proc/acpi/ibm) when present, else the generic hwmon sysfs
-# interface; on macOS it reads the SMC through a helper tool on PATH. Pick a
-# backend explicitly with FANWATCH_BACKEND. See `fanwatch --help`.
+# interface; on macOS it reads the SMC through a helper tool on PATH; on Windows
+# (Git Bash/MSYS2/Cygwin or WSL) it reads LibreHardwareMonitor's web server
+# through PowerShell. Pick a backend explicitly with FANWATCH_BACKEND. See
+# `fanwatch --help`.
 #
 # Usage: fanwatch [interval_seconds] [--sticky|--no-sticky]   (default 2s, pinned)
 #        fanwatch update                                       (self-update in place)
@@ -45,9 +47,11 @@ Options:
 Environment:
   FANWATCH_STICKY=0   start in the scrolling layout (same as --no-sticky)
   FANWATCH_RISE=N     investigate CPU jumps of N°C or more (default 3)
-  FANWATCH_BACKEND=X  force a backend: thinkpad | hwmon | macos (default: auto)
-  FANWATCH_OFF_BELOW=N  green below N°C on the hwmon/macos backends (default 55;
-                      the thinkpad backend derives this from thinkfan.yaml)
+  FANWATCH_BACKEND=X  force a backend: thinkpad | hwmon | macos | windows
+                      (default: auto)
+  FANWATCH_OFF_BELOW=N  green below N°C on the hwmon/macos/windows backends
+                      (default 55; the thinkpad backend derives it from
+                      thinkfan.yaml)
 
   Sensor overrides (hwmon backend; give a sysfs path to skip auto-detection):
   FANWATCH_CPU_TEMP, FANWATCH_GPU_TEMP   e.g. /sys/class/hwmon/hwmon7/temp1_input
@@ -61,6 +65,12 @@ Environment:
                       osx-cpu-temp: brew install osx-cpu-temp
                       istats:       gem install iStats
                       (powermetrics is preinstalled but Intel-only and needs sudo)
+
+  Windows (Git Bash/MSYS2/Cygwin or WSL; reads sensors via PowerShell):
+  FANWATCH_LHM_URL=U  LibreHardwareMonitor web-server URL
+                      (default http://localhost:8085/data.json). Run
+                      LibreHardwareMonitor as administrator and enable
+                      Options -> Remote Web Server for any reading.
 
 While running, Shift+Tab toggles between the pinned and scrolling layouts.
 EOF
@@ -100,9 +110,29 @@ IBM_FAN=/proc/acpi/ibm/fan
 IBM_THERMAL=/proc/acpi/ibm/thermal
 THINKFAN_CONFIG="${FANWATCH_THINKFAN_CONFIG:-/etc/thinkfan.yaml}"
 
+# Windows (Git Bash/MSYS2/Cygwin run natively; WSL runs a Linux kernel on Windows
+# hardware) exposes no /proc/acpi and no populated hwmon, so sensors are read from
+# LibreHardwareMonitor's web server through a PowerShell. The PowerShell process
+# runs on the Windows side, so its localhost reaches LHM even from WSL. WIN_SHELL
+# marks "on/under Windows"; PSEXE is the PowerShell to query with, empty when none
+# is on PATH (then the windows backend errors with how to add it). This is
+# read-only discovery (uname + command -v), safe to run when the tests source us.
+WIN_SHELL=0; PSEXE=""
+case $OS in
+  MINGW*|MSYS*|CYGWIN*) WIN_SHELL=1 ;;
+  Linux) grep -qi microsoft /proc/version 2>/dev/null && WIN_SHELL=1 ;;
+esac
+if (( WIN_SHELL )); then
+  for p in pwsh.exe powershell.exe pwsh powershell; do
+    command -v "$p" >/dev/null 2>&1 && { PSEXE=$p; break; }
+  done
+fi
+LHM_URL="${FANWATCH_LHM_URL:-http://localhost:8085/data.json}"
+
 detect_backend() {
   [[ -n ${FANWATCH_BACKEND:-} ]] && { printf '%s' "$FANWATCH_BACKEND"; return; }
   [[ $OS == Darwin ]]                && { printf 'macos';    return; }
+  (( WIN_SHELL ))                    && { printf 'windows';  return; }
   [[ -r $IBM_FAN && -r $IBM_THERMAL ]] && { printf 'thinkpad'; return; }
   printf 'hwmon'
 }
@@ -352,6 +382,104 @@ sample_macos() {
   [[ -n $cpu ]]
 }
 
+# --- Windows (LibreHardwareMonitor web server, via PowerShell) --------------
+# Windows has no /sys or /proc/acpi; CPU/GPU temperature, fan RPM and the fan's
+# commanded level live behind drivers that LibreHardwareMonitor (LHM) surfaces.
+# LHM's Remote Web Server serves its whole sensor tree as JSON, which a PowerShell
+# walks once per sample, so no curl or jq is needed. The program is a single-
+# quoted literal so MSYS path conversion leaves its slashes ("/amdcpu/…", the
+# "//" in the URL) and PowerShell "$" variables untouched. It prints one line,
+# "<cpu°C> <gpu°C> <rpm> <ctl%>", each rounded to a whole number or "-" when that
+# sensor is absent: CPU package temp (preferring "CPU Package", then Tctl/Tdie),
+# GPU temp (preferring "GPU Core", else any GPU temperature), the fastest fan's
+# RPM, and the highest fan-control percentage among headers whose tach spins
+# (unused headers stuck at 100% are skipped).
+# shellcheck disable=SC2016  # the $-tokens are PowerShell variables, not shell
+WIN_SAMPLE_PS='
+$ErrorActionPreference="SilentlyContinue"
+$d=Invoke-RestMethod -Uri $env:LHM_URL -TimeoutSec 4
+$cpuPkg="";$cpuTctl="";$cpuAny="";$gpuCore="";$gpuAny="";$rpm=$null;$ctl=$null
+$fanRpm=@{};$ctlList=@()
+function num($v){ if($v){ ($v -replace "[^0-9.,]","") -replace ",","." } }
+function dv($s){ if($s){ try{[double]::Parse($s,[Globalization.CultureInfo]::InvariantCulture)}catch{$null} } else {$null} }
+function Walk($n){
+  switch($n.Type){
+    "Temperature"{
+      if($n.SensorId -match "/(amd|intel)cpu/"){
+        if($n.Text -eq "CPU Package"){$script:cpuPkg=num $n.Value}
+        elseif($n.Text -match "Tctl|Tdie"){$script:cpuTctl=num $n.Value}
+        if($script:cpuAny -eq ""){$script:cpuAny=num $n.Value}
+      } elseif($n.SensorId -match "gpu"){
+        if($n.Text -match "GPU Core"){$script:gpuCore=num $n.Value}
+        elseif(-not $script:gpuAny){$script:gpuAny=num $n.Value}
+      }
+    }
+    "Fan"{ $f=dv (num $n.Value); if($f -ne $null){ $k=($n.SensorId -replace "/(fan|control)/","/"); $script:fanRpm[$k]=$f; if($script:rpm -eq $null -or $f -gt $script:rpm){$script:rpm=$f} } }
+    "Control"{ $c=dv (num $n.Value); if($c -ne $null){ $k=($n.SensorId -replace "/(fan|control)/","/"); $script:ctlList += ,@{k=$k;c=$c} } }
+  }
+  foreach($x in $n.Children){ Walk $x }
+}
+if($d){ Walk $d }
+# Only count a fan-control duty whose paired tach (same hardware path/index)
+# actually spins: motherboards expose unused fan headers stuck at 100%, which
+# would otherwise masquerade as the loudest fan.
+foreach($e in $ctlList){ $rp=$fanRpm[$e.k]; if($rp -ne $null -and $rp -gt 0 -and ($ctl -eq $null -or $e.c -gt $ctl)){$ctl=$e.c} }
+$cpu=if($cpuPkg){$cpuPkg}elseif($cpuTctl){$cpuTctl}else{$cpuAny}
+$gpu=if($gpuCore){$gpuCore}else{$gpuAny}
+function Rnd($v){ if($v -eq $null){"-"}else{[string][int][math]::Round([double]$v)} }
+"{0} {1} {2} {3}" -f (Rnd (dv $cpu)),(Rnd (dv $gpu)),(Rnd $rpm),(Rnd $ctl)
+'
+
+# One PowerShell spawn -> the "<cpu> <gpu> <rpm> <ctl>" line above. LHM_URL is
+# passed through the environment so the literal program stays MSYS-safe.
+win_read() {
+  LHM_URL="$LHM_URL" "$PSEXE" -NoProfile -Command "$WIN_SAMPLE_PS" 2>/dev/null | tr -d '\r'
+}
+
+# Apply one "<cpu> <gpu> <rpm> <ctl>" reading (each a whole number or "-") to the
+# per-tick globals. Split out from sample_windows so the parsing is unit-testable
+# without a PowerShell on PATH. Non-zero when there is no CPU reading.
+win_apply() {
+  cpu=""; gpu=""; rpm=""; rpmdisp="--"; leveltext="--"; levelcolor=$GR; levelkey=""; fanoff=0
+  local c g r ctl
+  read -r c g r ctl <<< "$1"
+  [[ $c =~ ^[0-9]+$ ]] && cpu=$c
+  [[ $g =~ ^[0-9]+$ ]] && gpu=$g
+  [[ $r =~ ^[0-9]+$ ]] && { rpm=$r; rpmdisp=$r; }
+
+  if [[ $ctl =~ ^[0-9]+$ ]]; then
+    leveltext="${ctl}%"; levelkey=$ctl
+    if   (( ctl == 0 )); then levelcolor=$G
+    elif (( ctl < 50 )); then levelcolor=$C
+    elif (( ctl < 80 )); then levelcolor=$Y
+    else                      levelcolor=$R; fi
+  elif [[ -n $rpm ]]; then
+    # No control sensor exposed: show on/off from the RPM, like the macOS backend.
+    levelkey="rpm:$rpm"
+    if (( rpm > 0 )); then leveltext="on";  levelcolor=$Y
+    else                   leveltext="off"; levelcolor=$G; fi
+  fi
+
+  if   [[ -n $rpm ]];        then (( rpm == 0 )) && fanoff=1
+  elif [[ $levelkey == 0 ]]; then fanoff=1; fi
+  [[ -n $cpu ]]
+}
+
+sample_windows() { win_apply "$(win_read)"; }
+
+# Probe LHM once at startup. A successful read yields a CPU temperature; if not,
+# LHM isn't running, its Remote Web Server is off, or it lacks the admin rights
+# to read CPU sensors. WIN_OK lets backend setup show guidance and exit rather
+# than loop on a blank screen. Spawns PowerShell, so it is only called from setup
+# (below the source guard), never at load time.
+discover_windows() {
+  WIN_OK=0
+  local c _
+  read -r c _ <<< "$(win_read)"
+  [[ $c =~ ^[0-9]+$ ]] && WIN_OK=1
+  return 0
+}
+
 sample() { "sample_$BACKEND"; }
 
 # --- colors -----------------------------------------------------------------
@@ -443,6 +571,35 @@ culprit_cpu_mac() {
   | awk -F'\t' '{ printf "%s%s %s%%", sep, $2, $1; sep=" · " }'
 }
 
+# Windows CPU culprit: /proc and `top -bn2` are absent, so sample every process's
+# cumulative CPU time twice a short interval apart through PowerShell and rank by
+# the delta, aggregated by process name and expressed as a percentage of one
+# core. e.g. "chrome 180% · Code 22% · explorer 8%"
+culprit_cpu_win() {
+  [[ -n $PSEXE ]] || return
+  # shellcheck disable=SC2016  # the $-tokens are PowerShell variables, not shell
+  "$PSEXE" -NoProfile -Command '
+    $ErrorActionPreference="SilentlyContinue"
+    $a=@{}; foreach($p in Get-Process){ if($p.CPU -ne $null){$a[$p.Id]=$p.CPU} }
+    Start-Sleep -Milliseconds 300
+    $d=@{}
+    foreach($p in Get-Process){
+      if($a.ContainsKey($p.Id) -and $p.CPU -ne $null){
+        $dt=$p.CPU-$a[$p.Id]
+        # Exclude the powershell/pwsh process running this very sampler (it burns
+        # CPU during the 300ms window and would otherwise top its own list), as
+        # culprit_cpu/_mac exclude their own top/ps/awk tooling.
+        if($dt -gt 0 -and $p.Name -notin @("powershell","pwsh","fanwatch")){ $d[$p.Name]=$d[$p.Name]+$dt }
+      }
+    }
+    $d.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 3 | ForEach-Object {
+      "{0} {1}" -f $_.Name,([int][math]::Round($_.Value*100/0.3))
+    }
+  ' 2>/dev/null | tr -d '\r' \
+  | awk 'NF { pct=$NF; name=$1; for(i=2;i<NF;i++) name=name" "$i;
+              printf "%s%s %s%%", sep, name, pct; sep=" · " }'
+}
+
 # When sourced (by the tests), stop here: everything above is definitions and
 # read-only discovery; everything below sets up the terminal, prints, and loops.
 [[ ${BASH_SOURCE[0]} != "$0" ]] && return 0
@@ -454,7 +611,7 @@ culprit_cpu_mac() {
 # active source in the header, OFF_NOTE adds the thinkpad fan-off hint.
 BACKEND=$(detect_backend)
 if ! declare -F "sample_$BACKEND" >/dev/null; then
-  printf 'fanwatch: unknown backend %q (set FANWATCH_BACKEND to thinkpad, hwmon, or macos)\n' "$BACKEND" >&2
+  printf 'fanwatch: unknown backend %q (set FANWATCH_BACKEND to thinkpad, hwmon, macos, or windows)\n' "$BACKEND" >&2
   exit 1
 fi
 
@@ -493,6 +650,24 @@ case $BACKEND in
     fi
     BACKEND_DESC="macos: $MAC_TEMP_TOOL"
     [[ -n $MAC_FAN_TOOL && $MAC_FAN_TOOL != "$MAC_TEMP_TOOL" ]] && BACKEND_DESC+=" + $MAC_FAN_TOOL"
+    ;;
+  windows)
+    OFF_BELOW="${FANWATCH_OFF_BELOW:-55}"
+    if [[ -z $PSEXE ]]; then
+      printf 'fanwatch: Windows shell detected but no PowerShell on PATH.\n' >&2
+      printf '  fanwatch reads sensors through powershell.exe or pwsh.exe; add\n' >&2
+      printf '  Windows\\System32 to PATH (Git Bash usually has it), then re-run.\n' >&2
+      exit 1
+    fi
+    discover_windows
+    if (( ! WIN_OK )); then
+      printf 'fanwatch: no sensor reading from LibreHardwareMonitor at %s\n' "$LHM_URL" >&2
+      printf '  Start LibreHardwareMonitor as administrator and turn on its web server\n' >&2
+      printf '  (Options -> Remote Web Server -> Run; default port 8085). If you moved\n' >&2
+      printf '  the port, set FANWATCH_LHM_URL (e.g. http://localhost:9000/data.json).\n' >&2
+      exit 1
+    fi
+    BACKEND_DESC="windows: LibreHardwareMonitor"
     ;;
 esac
 
@@ -638,7 +813,11 @@ while :; do
 
   # culprit callout on a meaningful CPU temp rise
   if [[ -n $prev_cpu ]] && (( cpu - prev_cpu >= RISE )); then
-    if [[ $BACKEND == macos ]]; then cpu_blame=$(culprit_cpu_mac); else cpu_blame=$(culprit_cpu); fi
+    case $BACKEND in
+      macos)   cpu_blame=$(culprit_cpu_mac) ;;
+      windows) cpu_blame=$(culprit_cpu_win) ;;
+      *)       cpu_blame=$(culprit_cpu) ;;
+    esac
     gpu_blame=$(culprit_gpu)
     line="   ${GR}└─ ${Y}▲ +$((cpu - prev_cpu))°C${GR}  likely: ${RST}${cpu_blame:-?}"
     [[ -n $gpu_blame ]] && line+="${GR}  │ gpu: ${RST}${gpu_blame}"
