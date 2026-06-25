@@ -46,8 +46,11 @@ curl -fsSL https://raw.githubusercontent.com/mjfwebb/fanwatch/main/install.sh | 
 
 It installs to `~/.local/bin` (override with `FANWATCH_BIN_DIR`), which must be
 on your PATH. On Linux and macOS fanwatch only reads sensors, so it needs no root
-and no udev setup. On Windows, run the same line from **Git Bash** or **WSL**
-(see the [windows backend](#backends) for the LibreHardwareMonitor setup).
+and no udev setup. On Windows, run the same line from **Git Bash** or **WSL**:
+the installer notices it's on Windows and, after a `[y/N]` prompt, installs
+LibreHardwareMonitor for you (via `winget`, falling back to the GitHub release
+zip), then prints the run-as-admin and web-server steps from the
+[windows backend](#backends).
 
 From a checkout instead:
 
